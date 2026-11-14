@@ -1,0 +1,32 @@
+[Unit]
+Description=XMPlus Web
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/web/xmplus-web/web
+ExecStart=/usr/bin/node /opt/web/xmplus-web/web/server.mjs
+Environment=HOST=192.168.0.35
+Environment=PORT=38110
+Environment=XMPLUS_DATA_DIR=/var/lib/xmplus-web
+StateDirectory=xmplus-web
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=4
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
