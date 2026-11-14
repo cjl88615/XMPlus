@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// XMPlus Web HTTP adapter. Third-party API implementation: ./lib/xmly.js (MIT).
+// 塔岛听书 HTTP adapter. Third-party API implementation: ./lib/xmly.js (MIT).
 import http from 'node:http';
+import { setDefaultResultOrder } from 'node:dns';
+import { setDefaultAutoSelectFamily } from 'node:net';
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, createReadStream, createWriteStream, statSync, rmSync, readdirSync } from 'node:fs';
 import { join, extname, resolve as resolvePath } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -13,6 +15,10 @@ import {
   resolvePlay, qrCreate, qrCheck, getCurrentUser, mySubscriptions, likeTracks,
   setSubscriptionAlbum, joinCookieMap, UA_WEB
 } from './lib/xmly.js';
+
+// 此部署环境没有可用的 IPv6 出口；Node 20 默认双栈探测会令音频 CDN 偶发超时。
+setDefaultResultOrder('ipv4first');
+setDefaultAutoSelectFamily(false);
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 38110);
@@ -60,7 +66,7 @@ const positive = (value, fallback, max) => {
   if (!Number.isSafeInteger(n) || n < 1 || n > max) throw new XmlyError('分页参数无效', 'BAD_REQUEST', 400);
   return n;
 };
-const cleanTitle = t => String(t || 'XMPlus').normalize('NFC').replace(/[\\/\u0000-\u001f\u007f<>:"|?*]/g, '_').replace(/^\.+/, '').slice(0, 88) || 'XMPlus';
+const cleanTitle = t => String(t || '塔岛听书').normalize('NFC').replace(/[\\/\u0000-\u001f\u007f<>:"|?*]/g, '_').replace(/^\.+/, '').slice(0, 88) || '塔岛听书';
 function httpError(msg, status = 400, code = 'BAD_REQUEST') { throw new XmlyError(msg, code, status); }
 function headers(res, status, values = {}) {
   res.writeHead(status, {
@@ -125,31 +131,50 @@ function getMediaUrl(value) {
   return url;
 }
 async function fetchMedia(url, range, signal) {
-  for (let redirects = 0; redirects < 5; redirects++) {
-    const parsed = getMediaUrl(url);
-    let response;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        response = await fetch(parsed, {
-          headers:{ 'user-agent':UA_WEB, referer:'https://www.ximalaya.com/', ...(range ? {range} : {}) },
-          redirect:'manual', signal
-        });
-        break;
-      } catch (e) {
-        if (signal?.aborted || attempt === 2) httpError('音频源连接失败', 502, 'AUDIO_NETWORK');
-        await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+  const original = getMediaUrl(url);
+  // 部分官方音频 CDN 节点在当前网络不通；镜像保持原路径与签名不变。
+  const mirrorHosts = ['a.xmcdn.com', 'aod.cos.tx.xmcdn.com'].includes(original.hostname)
+    ? ['aod.tx.xmcdn.com', 'audio.cos.xmcdn.com', original.hostname]
+    : [original.hostname];
+  for (const host of mirrorHosts) {
+    const candidate = new URL(original);
+    candidate.hostname = host;
+    let current = candidate.toString();
+    for (let redirects = 0; redirects < 5; redirects++) {
+      const parsed = getMediaUrl(current);
+      let response;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const connectTimeout = new AbortController();
+        const timer = setTimeout(() => connectTimeout.abort(), 7000);
+        try {
+          response = await fetch(parsed, {
+            headers:{ 'user-agent':UA_WEB, referer:'https://www.ximalaya.com/', ...(range ? {range} : {}) },
+            redirect:'manual',
+            signal: signal ? AbortSignal.any([signal, connectTimeout.signal]) : connectTimeout.signal
+          });
+          break;
+        } catch {
+          if (signal?.aborted) httpError('音频源连接已超时', 502, 'AUDIO_NETWORK');
+        } finally {
+          clearTimeout(timer);
+        }
       }
+      if (!response) break;
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const loc = response.headers.get('location');
+        await response.body?.cancel();
+        if (!loc) break;
+        current = new URL(loc, parsed).toString();
+        continue;
+      }
+      if ([403, 404, 429, 500, 502, 503, 504].includes(response.status) && host !== mirrorHosts.at(-1)) {
+        await response.body?.cancel();
+        break;
+      }
+      return response;
     }
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const loc = response.headers.get('location');
-      if (!loc) httpError('音频源跳转异常', 502, 'AUDIO_REDIRECT');
-      try { await response.body?.cancel(); } catch {}
-      url = new URL(loc, parsed).toString();
-      continue;
-    }
-    return response;
   }
-  httpError('音频源跳转次数过多', 502, 'AUDIO_REDIRECT');
+  httpError('音频源连接失败', 502, 'AUDIO_NETWORK');
 }
 async function audioFor(s, id) {
   s.audioCache ||= new Map();
@@ -165,7 +190,7 @@ async function streamAudio(req, res, s, id, download = false) {
   const audio = await audioFor(s, id);
   if (req.headers.range && !/^bytes=\d*-\d*$/.test(req.headers.range)) httpError('Range 格式无效', 416);
   const ctrl = new AbortController();
-  let timeout = setTimeout(() => ctrl.abort(), 18000);
+  let timeout = setTimeout(() => ctrl.abort(), 30000);
   let upstream = await fetchMedia(audio.url, req.headers.range, ctrl.signal);
   clearTimeout(timeout);
   if ([403,404].includes(upstream.status)) {
@@ -185,7 +210,7 @@ async function streamAudio(req, res, s, id, download = false) {
   const extension = type.includes('mpeg') ? '.mp3' : type.includes('aac') ? '.aac' : '.m4a';
   const out = { 'content-type':type, 'accept-ranges':'bytes', 'cache-control':'private, no-store' };
   for (const h of ['content-length','content-range']) { const v=upstream.headers.get(h); if (v) out[h]=v; }
-  if (download) out['content-disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(cleanTitle(audio.title || 'XMPlus-' + id) + extension);
+  if (download) out['content-disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(cleanTitle(audio.title || '塔岛听书-' + id) + extension);
   headers(res, upstream.status, out);
   if (req.method === 'HEAD') { await upstream.body?.cancel(); res.end(); return; }
   const stream = Readable.fromWeb(upstream.body);
@@ -290,7 +315,7 @@ const server = http.createServer(async (req,res) => {
       if (origin.host !== req.headers.host || !['http:','https:'].includes(origin.protocol)) httpError('跨站请求被拒绝',403,'CSRF');
     }
     checkRate(req);
-    if (path === '/api/health' && method === 'GET') return json(res,{ok:true,app:'XMPlus Web',time:new Date().toISOString()});
+    if (path === '/api/health' && method === 'GET') return json(res,{ok:true,app:'塔岛听书',time:new Date().toISOString()});
     const s = sessionFor(req,res);
     if (path === '/api/session' && method === 'GET') return json(res,{ok:true,...privateState(s)});
     if (path === '/api/search' && method === 'GET') {
@@ -384,7 +409,7 @@ const server = http.createServer(async (req,res) => {
       if (job.status!=='done') httpError('下载文件尚未就绪',409,'NOT_READY');
       const file=join(DOWNLOADS,job.id+'.zip');
       if (!existsSync(file)) httpError('下载文件已清理',410,'GONE');
-      headers(res,200,{'content-type':'application/zip','content-length':String(statSync(file).size),'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent('XMPlus-音频-'+job.id.slice(0,6)+'.zip')});
+      headers(res,200,{'content-type':'application/zip','content-length':String(statSync(file).size),'content-disposition':"attachment; filename*=UTF-8''"+encodeURIComponent('塔岛听书-音频-'+job.id.slice(0,6)+'.zip')});
       return createReadStream(file).pipe(res);
     }
     if (path.startsWith('/api/')) return json(res,{ok:false,error:'接口不存在',code:'NOT_FOUND'},404);
@@ -395,7 +420,7 @@ const server = http.createServer(async (req,res) => {
     const code=e instanceof XmlyError?e.code:'INTERNAL';
     const status=e instanceof XmlyError?e.status:500;
     // Do not log cookies, QR login payloads, or upstream media URLs.
-    if (status>=500) console.error('XMPlus Web: request failed',code,String(e.message||e).slice(0,150));
+    if (status>=500) console.error('塔岛听书: request failed',code,String(e.message||e).slice(0,150));
     json(res,{ok:false,error:e instanceof XmlyError?e.message:'服务暂时不可用',code},status);
   }
 });
@@ -410,5 +435,5 @@ setInterval(() => {
   for (const [ip,v] of limits) if (now()-v.start>120000) limits.delete(ip);
   if(changed) save();
 },600000).unref();
-server.listen(PORT,HOST,()=>console.log('XMPlus Web listening on '+HOST+':'+PORT));
+server.listen(PORT,HOST,()=>console.log('塔岛听书 listening on '+HOST+':'+PORT));
 process.on('SIGTERM',()=>server.close(()=>process.exit(0)));

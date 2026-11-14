@@ -1,9 +1,9 @@
 {
-  "name": "xmplus-web",
+  "name": "taliabu-audiobooks",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "XMPlus web edition: browser playback and downloads",
+  "description": "塔岛听书: 浏览器有声内容搜索、播放和下载",
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server.mjs",

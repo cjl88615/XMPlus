@@ -1,4 +1,4 @@
-/* XMPlus Web | AGPL-3.0-or-later */
+/* 塔岛听书 Web | AGPL-3.0-or-later */
 (() => {
   'use strict';
   const $ = query => document.querySelector(query);
@@ -14,7 +14,7 @@
       const url = new URL(String(value || ''), location.origin);
       const host = url.hostname.toLowerCase();
       if (url.protocol === 'https:' && (host === 'xmcdn.com' || host.endsWith('.xmcdn.com') || host === 'ximalaya.com' || host.endsWith('.ximalaya.com'))) return url.href;
-      if (url.origin === location.origin && ['/logo.png'].includes(url.pathname)) return url.href;
+      if (url.origin === location.origin && ['/favicon.svg'].includes(url.pathname)) return url.href;
     } catch {}
     return '';
   };
@@ -65,7 +65,7 @@
   }
   function loading() {content.innerHTML='<div class="loading-state"><span class="spinner"></span><span>加载中…</span></div>';}
   function head(title, summary='', action='') {
-    return '<div class="page-header"><div><div class="eyebrow">XMPLUS · LIBRARY</div><h1 class="page-heading">' + escapeHtml(title) + '</h1>' + (summary ? '<p class="page-summary">' + escapeHtml(summary) + '</p>' : '') + '</div>' + action + '</div>';
+    return '<div class="page-header"><div><div class="eyebrow">塔岛听书 · 有声馆</div><h1 class="page-heading">' + escapeHtml(title) + '</h1>' + (summary ? '<p class="page-summary">' + escapeHtml(summary) + '</p>' : '') + '</div>' + action + '</div>';
   }
   function empty(title, message, label='', action='') {
     return '<div class="empty">' + icon('headphones') + '<h3>' + escapeHtml(title) + '</h3><p>' + escapeHtml(message) + '</p>' + (label ? '<button class="btn" data-action="' + action + '">' + escapeHtml(label) + '</button>' : '') + '</div>';
@@ -284,7 +284,7 @@
     $('#player').hidden=false;
     $('#player-title').textContent=item.title||'声音';
     $('#player-subtitle').textContent=item.albumTitle||item.anchorName||'喜马拉雅';
-    $('#player-cover').src=cover(item.cover)||'/logo.png';
+    $('#player-cover').src=cover(item.cover)||'/favicon.svg';
     $('[data-action="toggle"]').innerHTML=icon(audio.paused?'play':'pause');
     $('[data-action="toggle"]').setAttribute('aria-label',audio.paused?'播放':'暂停');
     $('#time-current').textContent=timeText(audio.currentTime);
