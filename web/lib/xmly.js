@@ -455,35 +455,33 @@ const QUALITY_LABEL = {
 }
 
 /**
- * 统一解析播放地址：优先登录态 baseInfo（已购/VIP 也放行），失败或未登录时
- * 回退匿名 trackJson（仅免费曲可用）。返回 { url, quality, source, title, duration }。
+ * 优先使用新版 baseInfo：匿名用户也可获取免费音频，登录用户可获取已授权内容。
+ * 失败时回退旧版 trackJson（仅免费曲可用）。返回 { url, quality, source, title, duration }。
  */
 export async function resolvePlay(trackId, cookie) {
   const id = Number(trackId)
   if (!Number.isInteger(id) || id <= 0) throw new XmlyError('无效的曲目 ID', 'BAD_REQUEST', 400)
 
-  if (cookie) {
-    try {
-      const bi = await trackBaseInfo(id, cookie)
-      if (bi.isAuthorized) {
-        const pick = selectBestPlay(bi.playUrlList)
-        if (pick) {
-          const url = decryptUrl(pick.url)
-          if (url.startsWith('http')) {
-            return {
-              url,
-              quality: QUALITY_LABEL[pick.type] || pick.type,
-              source: 'baseInfo',
-              title: bi.title,
-              duration: bi.duration,
-            }
+  try {
+    const bi = await trackBaseInfo(id, cookie)
+    if (bi.isAuthorized) {
+      const pick = selectBestPlay(bi.playUrlList)
+      if (pick) {
+        const url = decryptUrl(pick.url)
+        if (url.startsWith('http')) {
+          return {
+            url,
+            quality: QUALITY_LABEL[pick.type] || pick.type,
+            source: 'baseInfo',
+            title: bi.title,
+            duration: bi.duration,
           }
         }
       }
-    } catch (err) {
-      if (err instanceof XmlyError && (err.code === 'NOT_FOUND')) throw err
-      // 其它错误（未登录/繁忙/网络）→ 回退匿名直链
     }
+  } catch (err) {
+    if (err instanceof XmlyError && err.code === 'NOT_FOUND') throw err
+    // 其它错误（鉴权/繁忙/网络）→ 回退匿名直链
   }
 
   const tj = await trackJson(id)
