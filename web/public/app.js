@@ -46,6 +46,8 @@
   };
   let toastTimer;
   let lastProgressSave = 0;
+  let pendingSeek = null;
+  let lastRecordedTrackId = null;
   function toast(message, error=false) {
     clearTimeout(toastTimer);
     toastEl.textContent = message;
@@ -145,7 +147,7 @@
     const albums=data.albums||[];
     const feature=albums[0];
     const cats=['有声小说','历史','相声','播客','儿童故事','悬疑','文学名著','音乐'];
-    const hero='<div class="hero"><div class="hero-copy"><span class="hero-kicker">XMPLUS / EXPLORE</span><h2>听见好故事。</h2><p>想听的声音，从这里找到。</p><div class="hero-actions"><button class="btn btn-hero" data-action="hero-play"' + (!feature?' disabled':'') + '>' + icon('play') + ' 探索专辑</button></div></div><div class="hero-art">' +
+    const hero='<div class="hero"><div class="hero-copy"><span class="hero-kicker">塔岛听书</span><h2>听见好故事。</h2><p>想听的声音，从这里找到。</p><div class="hero-actions"><button class="btn btn-hero" data-action="hero-play"' + (!feature?' disabled':'') + '>' + icon('play') + ' 探索专辑</button></div></div><div class="hero-art">' +
       (feature ? albumCover(feature,'hero-cover') : '<div class="hero-cover cover-placeholder">♪</div>') + '</div></div>';
     const pills='<div class="pills">'+cats.map(c=>'<button class="pill'+(c===category?' active':'')+'" data-category="'+escapeHtml(c)+'">'+escapeHtml(c)+'</button>').join('')+'</div>';
     content.innerHTML=hero+pills+'<div class="section-head"><h2>'+escapeHtml(category)+'</h2><p>'+countText(data.total)+' 个结果</p></div>'+
@@ -191,7 +193,7 @@
     const selected=state.selected.size;
     const detail='<button class="back-link" data-action="back">'+icon('back')+' 返回</button>'+
       '<div class="album-detail"><div>'+(src?'<img class="detail-cover" src="'+escapeHtml(src)+'" alt="专辑封面">':'<div class="detail-cover cover-placeholder">♪</div>')+'</div>'+
-      '<div class="detail-copy"><div class="eyebrow">ALBUM · XMPLUS</div><h1>'+escapeHtml(album.title)+'</h1>'+
+      '<div class="detail-copy"><div class="eyebrow">专辑</div><h1>'+escapeHtml(album.title)+'</h1>'+
       '<div class="detail-subtitle">'+escapeHtml(album.anchorName||'喜马拉雅')+(album.category?'　·　'+escapeHtml(album.category):'')+(album.trackCount?'　·　'+countText(album.trackCount)+' 集':'')+'</div>'+
       (desc?'<p class="detail-description">'+escapeHtml(desc)+'</p>':'')+
       '<div class="detail-actions"><button class="btn btn-primary" data-action="play-all">'+icon('play')+' 播放全部</button>'+
@@ -284,14 +286,20 @@
     $('#player').hidden=false;
     $('#player-title').textContent=item.title||'声音';
     $('#player-subtitle').textContent=item.albumTitle||item.anchorName||'喜马拉雅';
-    $('#player-cover').src=cover(item.cover)||'/favicon.svg';
-    $('[data-action="toggle"]').innerHTML=icon(audio.paused?'play':'pause');
-    $('[data-action="toggle"]').setAttribute('aria-label',audio.paused?'播放':'暂停');
-    $('#time-current').textContent=timeText(audio.currentTime);
+    const coverSrc=cover(item.cover)||'/favicon.svg';
+    if($('#player-cover').getAttribute('src')!==coverSrc)$('#player-cover').src=coverSrc;
+    const toggle=$('[data-action="toggle"]');
+    const glyph=toggle.querySelector('use');
+    const glyphHref='#ic-'+(audio.paused?'play':'pause');
+    if(glyph && glyph.getAttribute('href')!==glyphHref)glyph.setAttribute('href',glyphHref);
+    toggle.setAttribute('aria-label',audio.paused?'播放':'暂停');
+    if(pendingSeek===null){
+      $('#time-current').textContent=timeText(audio.currentTime);
+      $('#seek').value=audio.duration&&Number.isFinite(audio.duration)?Math.min(1000,Math.max(0,Math.floor(audio.currentTime/audio.duration*1000))):0;
+    }
     $('#time-duration').textContent=timeText(audio.duration||item.duration||0);
-    $('#seek').value=audio.duration&&Number.isFinite(audio.duration)?Math.min(1000,Math.max(0,Math.floor(audio.currentTime/audio.duration*1000))):0;
-    $('#speed').value=String(prefs.rate);
-    $('#volume').value=String(Math.round(prefs.volume*100));
+    if(document.activeElement!==$('#speed'))$('#speed').value=String(prefs.rate);
+    if(document.activeElement!==$('#volume'))$('#volume').value=String(Math.round(prefs.volume*100));
     document.body.classList.add('has-player');
   }
   async function playTrack(track, queue, idx, resumeAt=0, shouldPlay=true) {
@@ -299,6 +307,7 @@
     state.queue=queue&&queue.length?queue:[track];
     state.index=Math.max(0,idx);
     state.track=track;
+    pendingSeek=null;
     audio.pause();
     audio.src='/api/stream/'+track.id;
     audio.playbackRate=prefs.rate;
@@ -310,6 +319,11 @@
     if(shouldPlay) {
       try {await audio.play();} catch(e) { if(e.name!=='AbortError')toast(e.name==='NotAllowedError'?'浏览器已阻止自动播放，请点播放按钮':'播放失败，可能需要登录或已购权限',true); }
     }
+  }
+  function recordPlayback() {
+    const track=state.track;
+    if(!track || !toId(track.id) || lastRecordedTrackId===String(track.id))return;
+    lastRecordedTrackId=String(track.id);
     const entry={id:String(track.id),title:track.title||'',albumId:track.albumId||'',albumTitle:track.albumTitle||'',cover:track.cover||''};
     state.session.history=[{...entry,when:Date.now()},...state.session.history.filter(x=>String(x.id)!==String(track.id))].slice(0,200);
     void api('/api/history',{method:'POST',body:JSON.stringify(entry)}).catch(()=>{});
@@ -518,8 +532,17 @@
   });
   $('#menu-btn').addEventListener('click',()=>{$('#sidebar').classList.toggle('open');});
   $('#seek').addEventListener('input',e=>{
-    if(Number.isFinite(audio.duration)&&audio.duration>0) audio.currentTime=(Number(e.target.value)/1000)*audio.duration;
+    if(Number.isFinite(audio.duration)&&audio.duration>0){
+      pendingSeek=Number(e.target.value)/1000;
+      $('#time-current').textContent=timeText(pendingSeek*audio.duration);
+    }
   });
+  $('#seek').addEventListener('change',e=>{
+    if(Number.isFinite(audio.duration)&&audio.duration>0)audio.currentTime=(Number(e.target.value)/1000)*audio.duration;
+    pendingSeek=null;
+    renderPlayer();
+  });
+  $('#seek').addEventListener('pointercancel',()=>{pendingSeek=null;renderPlayer();});
   $('#volume').addEventListener('input',e=>{prefs.volume=Number(e.target.value)/100;audio.volume=prefs.volume;localStorage.setItem('xmplus_volume',String(prefs.volume));});
   audio.addEventListener('timeupdate',()=>{
     if(!state.track)return;
@@ -528,6 +551,7 @@
   });
   audio.addEventListener('durationchange',renderPlayer);
   audio.addEventListener('play',renderPlayer);
+  audio.addEventListener('playing',recordPlayback);
   audio.addEventListener('pause',()=>{renderPlayer();saveLast();});
   audio.addEventListener('ended',()=>{if(prefs.autoplay&&state.queue.length>1)moveTrack(1);});
   audio.addEventListener('error',()=>{if(state.track)toast('音频无法播放，请检查网络或账号权限',true);});
