@@ -719,18 +719,26 @@ class DownloadService {
                 result.page != page ||
                 result.pageSize != xmlyAlbumPageSize ||
                 result.album.id != albumId ||
-                result.tracks.length !=
+                result.tracks.length >
                     (result.total - offset).clamp(0, xmlyAlbumPageSize)) {
-              throw const XmlyException('invalid_catalogue', '专辑分页不完整或无效');
+              throw const XmlyException('invalid_catalogue', '专辑分页无效');
             }
             final ids = seen.toSet();
+            var previousPosition = offset;
             for (var index = 0; index < result.tracks.length; index++) {
               final track = result.tracks[index];
+              xmlyIdentifier(track.id);
+              final position = track.officialPosition;
               if (track.albumId != albumId ||
-                  track.officialPosition != offset + index + 1 ||
+                  position == null ||
+                  position <= previousPosition ||
+                  position > offset + xmlyAlbumPageSize ||
+                  position > result.total ||
+                  track.orderNo != position ||
                   !ids.add(track.id)) {
                 throw const XmlyException('invalid_catalogue', '专辑声音顺序无效');
               }
+              previousPosition = position;
             }
             return result;
           } catch (error, stack) {
@@ -999,7 +1007,7 @@ class DownloadService {
       "lib/services/download_service.dart::DownloadService._refreshAlbum",
     );
 
-    // Read one complete strict snapshot before admitting anything. A second
+    // Cover each requested source range before admitting anything. A second
     // change during this bounded pass stops visibly rather than looping.
     final tracks = <Track>[];
     final first = await _albumPage(
@@ -1011,7 +1019,7 @@ class DownloadService {
       checkpoint: checkpoint,
     );
     tracks.addAll(first.tracks);
-    for (var page = 2; tracks.length < first.total; page++) {
+    for (var page = 2; (page - 1) * xmlyAlbumPageSize < first.total; page++) {
       await checkpoint();
       final result = await _albumPage(
         job.accountIdentity,
@@ -3667,9 +3675,17 @@ class DownloadService {
                 }.contains(cause.code)) {
           throw const DownloadStopped();
         }
+        // Definitive means the request was rejected, not that retrying is
+        // futile: rate_limited is definitive too. Stop only known conditions
+        // which require changed content, credentials, permission or consent.
         if (attempt >= limit ||
             cause is XmlyException &&
                 const {
+                  'content_removed',
+                  'login_required',
+                  'login_expired',
+                  'permission_denied',
+                  'insufficient_quota',
                   'confirmation_changed',
                   'confirmation_required',
                   'usage_uncertain',
@@ -3825,6 +3841,7 @@ class DownloadService {
           'usage_uncertain',
           'receipt_required',
           'insufficient_quota',
+          'content_removed',
           'login_required',
           'login_expired',
           'original_account_required',
@@ -3901,6 +3918,8 @@ class DownloadService {
           return '听时暂时无法确认，正在自动核对，请稍后再试';
         case 'insufficient_quota':
           return '听时不足，请在官方 App 获取听时';
+        case 'content_removed':
+          return '该内容已下架，无法下载';
         case 'rate_limited':
           return '请求过于频繁，已达到重试上限';
         case 'login_expired':

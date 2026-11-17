@@ -17,9 +17,12 @@ import '../common/widgets/playback_action_button.dart';
 import '../models/xmly_models.dart';
 import '../services/app_log.dart';
 import '../services/app_runtime.dart';
+import 'anchor_page.dart';
 import 'catalogue_page.dart';
 import 'manuscript_reader.dart';
+import 'playback_mode_control.dart';
 import 'playback_settings_page.dart';
+import 'playback_skip_control.dart';
 import 'playback_speed_control.dart';
 import 'player_queue_panel.dart';
 import 'playback_volume_control.dart';
@@ -81,6 +84,253 @@ String playbackTime(double seconds) {
       : '$minutes:$rest';
 }
 
+/// The compact player lives outside Navigator, so its measured box is the
+/// shared-element destination rather than a Hero in the previous route.
+class PlayerPanelRoute extends MaterialPageRoute<void> {
+  PlayerPanelRoute({required AppRuntime runtime, required this.returnTarget})
+    : super(
+        settings: const RouteSettings(name: PlayerPanel.routeName),
+        allowSnapshotting: false,
+        builder: (_) {
+          AppLog.instance.trace(
+            'lib/pages/player_panel.dart::PlayerPanelRoute.new.closure#1',
+          );
+          return PlayerPanel(runtime: runtime, expanded: true);
+        },
+      ) {
+    AppLog.instance.trace('lib/pages/player_panel.dart::PlayerPanelRoute.new');
+  }
+
+  final GlobalKey returnTarget;
+  double? _commitValue, _commitStart;
+
+  double get expansion {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.expansion.get',
+    );
+    final value = animation?.value ?? 0;
+    final start = _commitStart;
+    return start == null || start == 0
+        ? value
+        : _commitValue! * (value / start).clamp(0.0, 1.0);
+  }
+
+  @override
+  Duration get transitionDuration {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.transitionDuration.get',
+    );
+    return const Duration(milliseconds: 300);
+  }
+
+  @override
+  Duration get reverseTransitionDuration {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.reverseTransitionDuration.get',
+    );
+    return const Duration(milliseconds: 260);
+  }
+
+  @override
+  bool canTransitionFrom(TransitionRoute<dynamic> previousRoute) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.canTransitionFrom',
+    );
+    return false;
+  }
+
+  @override
+  void handleStartBackGesture({double progress = 0.0}) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.handleStartBackGesture',
+    );
+    _commitValue = _commitStart = null;
+    super.handleStartBackGesture(progress: progress);
+  }
+
+  @override
+  void handleCommitBackGesture() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.handleCommitBackGesture',
+    );
+    _commitValue = expansion;
+    super.handleCommitBackGesture();
+    // Flutter restarts the route controller when committing. Normalize from
+    // its actual new value, preserving the last interactive rectangle/opacity.
+    _commitStart = animation?.value;
+  }
+
+  @override
+  Widget buildTransitions(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::PlayerPanelRoute.buildTransitions',
+    );
+    return _PlayerReturnTransition(route: this, child: child);
+  }
+}
+
+class _PlayerReturnTransition extends StatefulWidget {
+  const _PlayerReturnTransition({required this.route, required this.child});
+
+  final PlayerPanelRoute route;
+  final Widget child;
+
+  @override
+  State<_PlayerReturnTransition> createState() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransition.createState',
+    );
+    return _PlayerReturnTransitionState();
+  }
+}
+
+class _PlayerReturnTransitionState extends State<_PlayerReturnTransition>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.initState',
+    );
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.dispose',
+    );
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  bool handleStartBackGesture(PredictiveBackEvent event) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.handleStartBackGesture',
+    );
+    if (event.isButtonEvent ||
+        !widget.route.isCurrent ||
+        !widget.route.popGestureEnabled) {
+      return false;
+    }
+    widget.route.handleStartBackGesture(progress: 1 - event.progress);
+    return true;
+  }
+
+  @override
+  void handleUpdateBackGestureProgress(PredictiveBackEvent event) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.handleUpdateBackGestureProgress',
+    );
+    widget.route.handleUpdateBackGestureProgress(progress: 1 - event.progress);
+  }
+
+  @override
+  void handleCancelBackGesture() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.handleCancelBackGesture',
+    );
+    widget.route.handleCancelBackGesture();
+  }
+
+  @override
+  void handleCommitBackGesture() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.handleCommitBackGesture',
+    );
+    widget.route.handleCommitBackGesture();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerReturnTransitionState.build',
+    );
+    return AnimatedBuilder(
+      animation: widget.route.animation!,
+      child: widget.child,
+      builder: (context, child) {
+        AppLog.instance.trace(
+          'lib/pages/player_panel.dart::_PlayerReturnTransitionState.build.closure#1',
+        );
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            AppLog.instance.trace(
+              'lib/pages/player_panel.dart::_PlayerReturnTransitionState.build.closure#1.closure#1',
+            );
+            final expansion = widget.route.expansion;
+            final target = widget.route.returnTarget.currentContext
+                ?.findRenderObject();
+            final source = context.findRenderObject();
+            final size = constraints.biggest;
+            Rect? destination;
+            if (target is RenderBox &&
+                target.attached &&
+                target.hasSize &&
+                source is RenderBox &&
+                source.attached &&
+                target.size.isFinite &&
+                !target.size.isEmpty) {
+              final origin = source.globalToLocal(
+                target.localToGlobal(Offset.zero),
+              );
+              final measured = origin & target.size;
+              if ((Offset.zero & size).contains(measured.topLeft) &&
+                  measured.right <= size.width &&
+                  measured.bottom <= size.height) {
+                destination = measured;
+              }
+            }
+            // Never shrink towards an absent/offscreen compact player.
+            if (destination == null || size.isEmpty) {
+              return Opacity(opacity: expansion, child: child);
+            }
+            final rect = Rect.lerp(destination, Offset.zero & size, expansion)!;
+            // Animate the container, not the page's aspect ratio. Keep its
+            // layout/state intact while clipping and fading toward the dock.
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                Positioned.fromRect(
+                  rect: rect,
+                  child: Opacity(
+                    opacity: (expansion / 0.2).clamp(0.0, 1.0),
+                    child: ClipRRect(
+                      key: const ValueKey('playerReturnSurface'),
+                      borderRadius: BorderRadius.circular(16 * (1 - expansion)),
+                      child: ColoredBox(
+                        color: Theme.of(context).colorScheme.surface,
+                        child: OverflowBox(
+                          alignment: Alignment.topCenter,
+                          minWidth: size.width,
+                          maxWidth: size.width,
+                          minHeight: size.height,
+                          maxHeight: size.height,
+                          child: Transform.scale(
+                            scale: rect.width / size.width,
+                            alignment: Alignment.topCenter,
+                            child: Opacity(opacity: expansion, child: child),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
 class PlayerPanel extends StatefulWidget {
   const PlayerPanel({
     required this.runtime,
@@ -139,6 +389,10 @@ class _PlayerPanelState extends State<PlayerPanel> {
   bool _manuscriptLoaded = false;
   int _manuscriptRequest = 0;
   Completer<void>? _manuscriptCancelled;
+  Album? _creatorAlbum;
+  String? _creatorTrackId, _creatorAlbumId, _creatorResolvedAlbumId;
+  int _creatorRequest = 0;
+  Completer<void>? _creatorCancelled;
   AppRuntime get _runtime {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._runtime.get",
@@ -163,10 +417,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
     _runtime.addListener(_favoriteContextChanged);
     _runtime.addListener(_likeContextChanged);
     _runtime.addListener(_manuscriptContextChanged);
+    _runtime.addListener(_creatorContextChanged);
     if (widget.expanded) {
       unawaited(_refreshFavorite());
       _refreshLikes();
       unawaited(_refreshManuscript());
+      unawaited(_refreshCreator());
     }
   }
 
@@ -181,9 +437,11 @@ class _PlayerPanelState extends State<PlayerPanel> {
       oldWidget.runtime.removeListener(_favoriteContextChanged);
       oldWidget.runtime.removeListener(_likeContextChanged);
       oldWidget.runtime.removeListener(_manuscriptContextChanged);
+      oldWidget.runtime.removeListener(_creatorContextChanged);
       _runtime.addListener(_manuscriptContextChanged);
       _runtime.addListener(_favoriteContextChanged);
       _runtime.addListener(_likeContextChanged);
+      _runtime.addListener(_creatorContextChanged);
       _dragPosition = null;
       _dragEpoch = null;
     }
@@ -196,6 +454,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
     if (oldWidget.runtime != _runtime ||
         oldWidget.expanded != widget.expanded) {
       unawaited(_refreshManuscript());
+      unawaited(_refreshCreator());
     }
   }
 
@@ -208,6 +467,10 @@ class _PlayerPanelState extends State<PlayerPanel> {
     _runtime.removeListener(_favoriteContextChanged);
     _runtime.removeListener(_likeContextChanged);
     _runtime.removeListener(_manuscriptContextChanged);
+    _runtime.removeListener(_creatorContextChanged);
+    _creatorRequest++;
+    _creatorCancelled?.complete();
+    _creatorCancelled = null;
     _manuscriptRequest++;
     _manuscriptCancelled?.complete();
     _manuscriptCancelled = null;
@@ -300,13 +563,113 @@ class _PlayerPanelState extends State<PlayerPanel> {
           );
   }
 
+  void _creatorContextChanged() {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerPanelState._creatorContextChanged',
+    );
+    if (!mounted || !widget.expanded) return;
+    final track = _runtime.player.current;
+    if (track?.id != _creatorTrackId || track?.albumId != _creatorAlbumId) {
+      unawaited(_refreshCreator());
+      return;
+    }
+    final cached = track == null || track.albumId.isEmpty
+        ? null
+        : _runtime.albumCache[track.albumId]?.album;
+    if (cached?.anchorUid != null && !identical(cached, _creatorAlbum)) {
+      setState(() {
+        AppLog.instance.trace(
+          'lib/pages/player_panel.dart::_PlayerPanelState._creatorContextChanged.closure#1',
+        );
+        _creatorAlbum = cached;
+      });
+    }
+  }
+
+  Future<void> _refreshCreator() async {
+    AppLog.instance.trace(
+      'lib/pages/player_panel.dart::_PlayerPanelState._refreshCreator',
+    );
+    final runtime = _runtime;
+    final track = runtime.player.current;
+    final trackId = track?.id, albumId = track?.albumId;
+    final request = ++_creatorRequest;
+    _creatorCancelled?.complete();
+    _creatorCancelled = null;
+    _creatorTrackId = trackId;
+    _creatorAlbumId = albumId;
+    final cached = albumId == null || albumId.isEmpty
+        ? null
+        : runtime.albumCache[albumId]?.album;
+    final previous = _creatorAlbum?.id == albumId ? _creatorAlbum : null;
+    setState(() {
+      AppLog.instance.trace(
+        'lib/pages/player_panel.dart::_PlayerPanelState._refreshCreator.closure#1',
+      );
+      _creatorAlbum = cached?.anchorUid != null ? cached : previous ?? cached;
+    });
+    if (!widget.expanded ||
+        trackId == null ||
+        albumId == null ||
+        albumId.isEmpty ||
+        _creatorAlbum?.anchorUid != null ||
+        (previous != null && _creatorResolvedAlbumId == albumId)) {
+      return;
+    }
+    final cancelled = _creatorCancelled = Completer<void>();
+    bool current() {
+      AppLog.instance.trace(
+        'lib/pages/player_panel.dart::_PlayerPanelState._refreshCreator.current',
+      );
+      return mounted &&
+          widget.expanded &&
+          identical(runtime, _runtime) &&
+          request == _creatorRequest &&
+          runtime.player.current?.id == trackId &&
+          runtime.player.current?.albumId == albumId;
+    }
+
+    try {
+      final page = await runtime.anonymous.withReadPolicy(
+        () {
+          AppLog.instance.trace(
+            'lib/pages/player_panel.dart::_PlayerPanelState._refreshCreator.closure#2',
+          );
+          return runtime.anonymous.album(albumId, pageSize: 1);
+        },
+        rateLimitRetries: 0,
+        cancelled: cancelled.future,
+      );
+      if (current() && page.album.id == albumId) {
+        setState(() {
+          AppLog.instance.trace(
+            'lib/pages/player_panel.dart::_PlayerPanelState._refreshCreator.closure#3',
+          );
+          _creatorAlbum = page.album;
+          _creatorResolvedAlbumId = albumId;
+        });
+      }
+    } catch (error, stack) {
+      if (current()) {
+        _recordPlayerPanelError(
+          'Player creator load failed',
+          error,
+          stack,
+          recoverable: true,
+        );
+      }
+    } finally {
+      if (current()) _creatorCancelled = null;
+    }
+  }
+
   void _manuscriptContextChanged() {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._manuscriptContextChanged",
     );
 
     if (!mounted || !widget.expanded) return;
-    final client = _runtime.client;
+    final client = _runtime.player.currentClient;
     if (!identical(client, _manuscriptClient) ||
         client.cacheIdentity != _manuscriptKey ||
         _runtime.player.current?.id != _manuscriptTrackId) {
@@ -323,7 +686,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
         "lib/pages/player_panel.dart::_PlayerPanelState._refreshManuscript.closure#1",
       );
 
-      final client = _runtime.client, key = _runtime.client.cacheIdentity;
+      final client = _runtime.player.currentClient,
+          key = _runtime.player.currentClient.cacheIdentity;
       final trackId = _runtime.player.current?.id;
       if (!force &&
           widget.expanded &&
@@ -358,8 +722,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
         return mounted &&
             widget.expanded &&
             request == _manuscriptRequest &&
-            identical(client, _runtime.client) &&
-            key == _runtime.client.cacheIdentity &&
+            identical(client, _runtime.player.currentClient) &&
+            key == _runtime.player.currentClient.cacheIdentity &&
             trackId == _runtime.player.current?.id;
       }
 
@@ -454,10 +818,13 @@ class _PlayerPanelState extends State<PlayerPanel> {
     AppLog.instance.trace(
       'lib/pages/player_panel.dart::_PlayerPanelState._pageOrder.get',
     );
-    if (!_hasManuscript) return const [0, 2];
-    return _paneCount == 2 && _secondaryPage == 2
-        ? const [0, 2, 1]
-        : const [0, 1, 2];
+    final secondary = [if (_hasManuscript) 1, 2, 3];
+    return [
+      0,
+      if (_paneCount == 2) _secondaryPage,
+      for (final page in secondary)
+        if (_paneCount == 1 || page != _secondaryPage) page,
+    ];
   }
 
   void _configurePanes(int count) {
@@ -584,7 +951,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
 
     if (!widget.expanded || !mounted) return;
-    final client = _runtime.client;
+    final client = _runtime.player.currentClient;
     final changed =
         !identical(client, _favoriteClient) ||
         client.cacheIdentity != _favoriteKey ||
@@ -611,8 +978,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
     return mounted &&
         request == _favoriteRequest &&
-        identical(client, _runtime.client) &&
-        key == _runtime.client.cacheIdentity &&
+        identical(client, _runtime.player.currentClient) &&
+        key == _runtime.player.currentClient.cacheIdentity &&
         trackId == _runtime.player.current?.id;
   }
 
@@ -621,7 +988,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
       "lib/pages/player_panel.dart::_PlayerPanelState._likeContextChanged",
     );
     if (!mounted) return;
-    final client = _runtime.client;
+    final client = _runtime.player.currentClient;
     if (!identical(client, _likeClient) ||
         client.cacheIdentity != _likeKey ||
         _runtime.player.current?.id != _likeTrackId) {
@@ -634,8 +1001,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
       "lib/pages/player_panel.dart::_PlayerPanelState._likeContextCurrent",
     );
     return mounted &&
-        identical(client, _runtime.client) &&
-        key == _runtime.client.cacheIdentity &&
+        identical(client, _runtime.player.currentClient) &&
+        key == _runtime.player.currentClient.cacheIdentity &&
         trackId == _runtime.player.current?.id;
   }
 
@@ -668,7 +1035,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._refreshLikes",
     );
-    final client = _runtime.client, key = _runtime.client.cacheIdentity;
+    final client = _runtime.player.currentClient,
+        key = _runtime.player.currentClient.cacheIdentity;
     final track = _runtime.player.current;
     final sameContext =
         identical(client, _likeClient) &&
@@ -699,7 +1067,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._refreshLikeCount",
     );
-    final client = _runtime.client, key = _runtime.client.cacheIdentity;
+    final client = _runtime.player.currentClient,
+        key = _runtime.player.currentClient.cacheIdentity;
     if (!_likeContextCurrent(client, key, track.id)) return;
     final request = ++_likeCountRequest;
     setState(() {
@@ -786,7 +1155,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
       AppLog.instance.trace(
         "lib/pages/player_panel.dart::_PlayerPanelState._likeAction.closure#1",
       );
-      final client = _runtime.client, key = _runtime.client.cacheIdentity;
+      final client = _runtime.player.currentClient,
+          key = _runtime.player.currentClient.cacheIdentity;
       if (_likeBusy || !_likeContextCurrent(client, key, track.id)) {
         return;
       }
@@ -866,8 +1236,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
     final current =
         track != null &&
-        identical(_likeClient, _runtime.client) &&
-        _likeKey == _runtime.client.cacheIdentity &&
+        identical(_likeClient, _runtime.player.currentClient) &&
+        _likeKey == _runtime.player.currentClient.cacheIdentity &&
         _likeTrackId == track.id;
     final count = current ? _likeCount : null;
     return Column(
@@ -879,7 +1249,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                   ? '取消点赞'
                   : _likeBusy
                   ? '正在处理'
-                  : _runtime.client.accountAvailable
+                  : _runtime.player.currentClient.accountAvailable
                   ? '点赞'
                   : '点赞（需登录）'} · 喜欢数：${count ?? '未知'}',
           onPressed: track == null || !current || _likeBusy
@@ -935,7 +1305,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
         "lib/pages/player_panel.dart::_PlayerPanelState._refreshFavorite.closure#1",
       );
 
-      final client = _runtime.client, key = _runtime.client.cacheIdentity;
+      final client = _runtime.player.currentClient,
+          key = _runtime.player.currentClient.cacheIdentity;
       final track = _runtime.player.current;
       final request = ++_favoriteRequest;
       _favoriteClient = client;
@@ -998,7 +1369,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
       );
 
       if (_favoriteBusy || track.id != _runtime.player.current?.id) return;
-      final client = _runtime.client, key = _runtime.client.cacheIdentity;
+      final client = _runtime.player.currentClient,
+          key = _runtime.player.currentClient.cacheIdentity;
       if (!client.accountAvailable) {
         setState(() {
           AppLog.instance.trace(
@@ -1112,7 +1484,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
     return _favoriteBusy
         ? '正在读取收藏状态'
-        : !_runtime.client.accountAvailable
+        : !_runtime.player.currentClient.accountAvailable
         ? '收藏（需登录）'
         : _favorite == null
         ? '重试收藏状态'
@@ -1127,8 +1499,8 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
     final current =
         track != null &&
-        identical(_likeClient, _runtime.client) &&
-        _likeKey == _runtime.client.cacheIdentity &&
+        identical(_likeClient, _runtime.player.currentClient) &&
+        _likeKey == _runtime.player.currentClient.cacheIdentity &&
         _likeTrackId == track.id;
     final count = current ? _favoriteCount : null;
     if (_favoriteError == null) {
@@ -1341,6 +1713,13 @@ class _PlayerPanelState extends State<PlayerPanel> {
     );
   }
 
+  void _skipSegments() {
+    AppLog.instance.trace(
+      "lib/pages/player_panel.dart::_PlayerPanelState._skipSegments",
+    );
+    showSkipSegmentsSettings(_navigator.context, _runtime);
+  }
+
   void _openAlbum(String albumId) {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._openAlbum",
@@ -1360,6 +1739,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
         return AlbumPageView(
           runtime: _runtime,
           albumId: albumId,
+          accountIdentity: _runtime.player.libraryIdentity,
           inPanel: true,
         );
       },
@@ -1370,6 +1750,10 @@ class _PlayerPanelState extends State<PlayerPanel> {
     AppLog.instance.trace(
       "lib/pages/player_panel.dart::_PlayerPanelState._queue",
     );
+    if (widget.expanded) {
+      _selectPage(3);
+      return;
+    }
     showLocalPanel<void>(
       context: _navigator.context,
       title: '播放列表',
@@ -1565,80 +1949,91 @@ class _PlayerPanelState extends State<PlayerPanel> {
           AppLog.instance.trace(
             "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider",
           );
-          return SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              trackHeight: 3,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
-              overlayShape: const RoundSliderOverlayShape(overlayRadius: 18),
-              inactiveTrackColor: colors.onSurface.withValues(alpha: 0.12),
-            ),
-            child: KeyedSubtree(
-              key: ValueKey((player, epoch, dock)),
-              child: Slider(
-                key: dock ? const ValueKey('dockSeekSlider') : null,
-                padding: EdgeInsets.symmetric(
-                  vertical: dock ? 12 : 22,
-                  horizontal: 5,
-                ),
-                value: position,
-                max: max > 0 ? max : 1,
-                label: playbackTime(position),
-                semanticFormatterCallback: playbackTime,
-                onChangeStart: track == null || max == 0 || _busy
-                    ? null
-                    : (_) {
-                        AppLog.instance.trace(
-                          "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#1",
-                        );
-                        _dragEpoch = epoch;
-                      },
-                onChanged: track == null || max == 0 || _busy
-                    ? null
-                    : (value) {
-                        AppLog.instance.trace(
-                          "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#2",
-                        );
+          // A track change can remount this slider while a popup excludes the
+          // dock's semantics. Keep its value-indicator portal in that subtree.
+          final slider = Overlay.wrap(
+            alwaysSizeToContent: true,
+            clipBehavior: Clip.none,
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                overlayShape: const RoundSliderOverlayShape(overlayRadius: 18),
+                inactiveTrackColor: colors.onSurface.withValues(alpha: 0.12),
+              ),
+              child: KeyedSubtree(
+                key: ValueKey((player, epoch, dock)),
+                child: Slider(
+                  key: dock ? const ValueKey('dockSeekSlider') : null,
+                  padding: EdgeInsets.symmetric(
+                    vertical: dock ? 12 : 22,
+                    horizontal: 5,
+                  ),
+                  value: position,
+                  max: max > 0 ? max : 1,
+                  label: playbackTime(position),
+                  semanticFormatterCallback: playbackTime,
+                  onChangeStart: track == null || max == 0 || _busy
+                      ? null
+                      : (_) {
+                          AppLog.instance.trace(
+                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#1",
+                          );
+                          _dragEpoch = epoch;
+                        },
+                  onChanged: track == null || max == 0 || _busy
+                      ? null
+                      : (value) {
+                          AppLog.instance.trace(
+                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#2",
+                          );
 
-                        if (_dragEpoch == epoch &&
-                            player.playbackEpoch == epoch) {
+                          if (_dragEpoch == epoch &&
+                              player.playbackEpoch == epoch) {
+                            setState(() {
+                              AppLog.instance.trace(
+                                "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#2.closure#1",
+                              );
+                              _dragPosition = value;
+                            });
+                          }
+                        },
+                  onChangeEnd: track == null || max == 0 || _busy
+                      ? null
+                      : (value) async {
+                          AppLog.instance.trace(
+                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3",
+                          );
+
+                          final selectedEpoch = _dragEpoch;
                           setState(() {
                             AppLog.instance.trace(
-                              "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#2.closure#1",
+                              "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3.closure#1",
                             );
-                            _dragPosition = value;
+
+                            _dragPosition = null;
+                            _dragEpoch = null;
                           });
-                        }
-                      },
-                onChangeEnd: track == null || max == 0 || _busy
-                    ? null
-                    : (value) async {
-                        AppLog.instance.trace(
-                          "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3",
-                        );
-
-                        final selectedEpoch = _dragEpoch;
-                        setState(() {
-                          AppLog.instance.trace(
-                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3.closure#1",
-                          );
-
-                          _dragPosition = null;
-                          _dragEpoch = null;
-                        });
-                        if (selectedEpoch != epoch ||
-                            player.playbackEpoch != epoch) {
-                          return;
-                        }
-                        await _act(() {
-                          AppLog.instance.trace(
-                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3.closure#2",
-                          );
-                          return player.seek(value, expectedEpoch: epoch);
-                        });
-                      },
+                          if (selectedEpoch != epoch ||
+                              player.playbackEpoch != epoch) {
+                            return;
+                          }
+                          await _act(() {
+                            AppLog.instance.trace(
+                              "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.seekSlider.closure#3.closure#2",
+                            );
+                            return player.seek(value, expectedEpoch: epoch);
+                          });
+                        },
+                ),
               ),
             ),
           );
+          // A bounded-height Row makes Slider consume all remaining height.
+          // Constrain only the dock control, not its text or the full player.
+          return dock
+              ? SizedBox(height: kMinInteractiveDimension, child: slider)
+              : slider;
         }
 
         if (!widget.expanded) {
@@ -1782,6 +2177,13 @@ class _PlayerPanelState extends State<PlayerPanel> {
                             vertical: true,
                             size: 48,
                           ),
+                        if (availableWidth >= 1080)
+                          PlaybackModeButton(runtime: _runtime),
+                        if (availableWidth >= 1200)
+                          PlaybackSkipButton(
+                            runtime: _runtime,
+                            onPressed: _skipSegments,
+                          ),
                         if (showProgress)
                           PlaybackActionButton(
                             size: 48,
@@ -1879,6 +2281,14 @@ class _PlayerPanelState extends State<PlayerPanel> {
             : player.policy.sleepWaitingForEnd || remaining == null
             ? '本集结束后${sleep.action.name == 'exit' ? '退出' : '暂停'}'
             : playbackTime(remaining.inSeconds.toDouble());
+        final creatorAlbum = _creatorAlbum?.id == track?.albumId
+            ? _creatorAlbum
+            : null;
+        final albumArtist = creatorAlbum?.artist.trim() ?? '';
+        final artist = albumArtist.isNotEmpty
+            ? albumArtist
+            : track?.artist.trim() ?? '';
+        final anchorUid = creatorAlbum?.anchorUid;
         final metadata = Column(
           crossAxisAlignment: widePlayer
               ? CrossAxisAlignment.center
@@ -1898,7 +2308,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
             if (track != null &&
                 (track.albumId.isNotEmpty ||
                     track.album.isNotEmpty ||
-                    track.artist.isNotEmpty)) ...[
+                    artist.isNotEmpty)) ...[
               SizedBox(height: compact ? 4 : 10),
               if (track.albumId.isNotEmpty)
                 TextButton(
@@ -1935,11 +2345,66 @@ class _PlayerPanelState extends State<PlayerPanel> {
                     color: colors.onSurfaceVariant,
                   ),
                 ),
-              if (track.artist.isNotEmpty)
-                AdaptiveText(
-                  track.artist,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: colors.onSurfaceVariant,
+              if (artist.isNotEmpty)
+                Tooltip(
+                  message: '查看主播：$artist',
+                  child: TextButton(
+                    key: const ValueKey('playerAnchorLink'),
+                    onPressed: () {
+                      AppLog.instance.trace(
+                        'lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#4',
+                      );
+                      final runtime = _runtime;
+                      final accountIdentity = runtime.player.libraryIdentity;
+                      _navigator.push(
+                        MaterialPageRoute<void>(
+                          settings: const RouteSettings(
+                            name: AnchorPage.routeName,
+                          ),
+                          builder: (_) {
+                            AppLog.instance.trace(
+                              'lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#4.closure#1',
+                            );
+                            return AnchorPage(
+                              runtime: runtime,
+                              uid: anchorUid,
+                              trackId: track.id,
+                              initialName: artist,
+                              accountIdentity: accountIdentity,
+                            );
+                          },
+                        ),
+                      );
+                    },
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(48, 48),
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      alignment: widePlayer
+                          ? Alignment.center
+                          : Alignment.centerLeft,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ExcludeSemantics(
+                          child: ClipOval(
+                            child: CoverImage(
+                              uri: creatorAlbum?.anchorAvatarUrl,
+                              size: 28,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Text(
+                            artist,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
             ],
@@ -1951,6 +2416,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
           runSpacing: 4,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
+            PlaybackModeButton(runtime: _runtime),
             PlaybackSpeedControl(
               key: ValueKey((_runtime, track?.id)),
               runtime: _runtime,
@@ -1959,10 +2425,11 @@ class _PlayerPanelState extends State<PlayerPanel> {
                   : null,
             ),
             PlaybackVolumeControl(runtime: _runtime, vertical: true),
+            PlaybackSkipButton(runtime: _runtime, onPressed: _skipSegments),
             PlaybackActionButton(
               onPressed: () {
                 AppLog.instance.trace(
-                  "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#4",
+                  "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#5",
                 );
                 showSleepTimerDialog(context, _runtime);
               },
@@ -1988,11 +2455,11 @@ class _PlayerPanelState extends State<PlayerPanel> {
                   ? null
                   : () {
                       AppLog.instance.trace(
-                        "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#5",
+                        "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#6",
                       );
                       _act(() async {
                         AppLog.instance.trace(
-                          "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#5.closure#1",
+                          "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#6.closure#1",
                         );
 
                         final savedPosition = player.position;
@@ -2097,7 +2564,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                 child: PlaybackActionButton(
                   onPressed: () {
                     AppLog.instance.trace(
-                      "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#6",
+                      "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#7",
                     );
 
                     player.cancelSleep();
@@ -2127,7 +2594,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
               tooltip: '收起播放器',
               onPressed: () {
                 AppLog.instance.trace(
-                  "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#7",
+                  "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#8",
                 );
                 Navigator.of(context).maybePop();
               },
@@ -2154,6 +2621,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                       if (_paneCount == 1) (0, '播放'),
                       if (_hasManuscript) (1, '文稿'),
                       (2, '评论'),
+                      (3, '播放列表'),
                     ])
                       AppTabButton(
                         key: ValueKey(index),
@@ -2165,7 +2633,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                             index,
                         onPressed: () {
                           AppLog.instance.trace(
-                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#8",
+                            "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#9",
                           );
                           _selectPage(index);
                         },
@@ -2176,7 +2644,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                   child: LayoutBuilder(
                     builder: (context, constraints) {
                       AppLog.instance.trace(
-                        "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#9",
+                        "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#10",
                       );
                       final minPaneWidth = math.max(
                         460.0,
@@ -2193,7 +2661,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                         LayoutBuilder(
                           builder: (context, constraints) {
                             AppLog.instance.trace(
-                              "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#9.closure#1",
+                              "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#10.closure#1",
                             );
                             final textHeight = MediaQuery.textScalerOf(context)
                                 .scale(56);
@@ -2256,6 +2724,12 @@ class _PlayerPanelState extends State<PlayerPanel> {
                                 runtime: _runtime,
                                 track: track,
                               ),
+                        !_visitedPages.contains(3)
+                            ? const SizedBox.shrink()
+                            : PlayerQueuePanel(
+                                key: ValueKey(_runtime.player),
+                                runtime: _runtime,
+                              ),
                       ];
                       return PrimaryScrollController.none(
                         child: ScrollConfiguration(
@@ -2275,7 +2749,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                             itemCount: order.length,
                             findChildIndexCallback: (key) {
                               AppLog.instance.trace(
-                                "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#9.closure#2",
+                                "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#10.closure#2",
                               );
                               final index = order.indexOf(
                                 (key as ValueKey<int>).value,
@@ -2284,7 +2758,7 @@ class _PlayerPanelState extends State<PlayerPanel> {
                             },
                             itemBuilder: (context, index) {
                               AppLog.instance.trace(
-                                "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#9.closure#3",
+                                "lib/pages/player_panel.dart::_PlayerPanelState.build.closure#1.closure#10.closure#3",
                               );
                               final page = order[index];
                               return _PlayerPage(

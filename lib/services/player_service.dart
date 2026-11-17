@@ -6,6 +6,7 @@ import 'package:synchronized/synchronized.dart';
 import 'package:uuid/uuid.dart';
 
 import '../api/xmly_client.dart';
+import '../api/xmly_catalogue.dart';
 import '../api/xmly_history.dart';
 import '../models/xmly_models.dart';
 import '../storage/app_storage.dart';
@@ -85,7 +86,7 @@ class PlayerService {
         "lib/services/player_service.dart::PlayerService.new.closure#1",
       );
 
-      final seekRevision = _seekRevision;
+      final seekRevision = _seekRevision, advanceIntent = _advanceIntent;
       final recorded =
           !_closed &&
           _source != null &&
@@ -115,6 +116,7 @@ class PlayerService {
           return _observe(
             snapshot,
             seekRevision: seekRevision,
+            advanceIntent: advanceIntent,
             stateAlreadyRecorded: recorded,
           );
         });
@@ -180,7 +182,8 @@ class PlayerService {
   final MediaPipeline pipeline;
   final XmlyClient anonymous;
   final AudioDriver _driver;
-  final Future<DownloadBatch> Function(List<Track>)? prepareDownload;
+  final Future<DownloadBatch> Function(List<Track>, {String? accountIdentity})?
+  prepareDownload;
   final Future<bool> Function(DownloadBatch)? confirmDownload;
   final Future<void> Function()? exitApplication;
   final DateTime Function() _clock;
@@ -198,6 +201,10 @@ class PlayerService {
   Future<AudioProxy>? _proxyOpening;
   PlaybackSource? _source;
   List<Track> _queue = [];
+  Map<String, String> _queueAccountIdentities = {};
+  final PlaybackShuffle _shuffle = PlaybackShuffle();
+  String _appliedLoopMode = 'off';
+  int? _orderLoadingRequest;
   Completer<void> _requestChanged = Completer<void>();
   int cursor = -1, generation = 0;
   int _request = 0, _epoch = 0, _advanceIntent = 0;
@@ -219,7 +226,7 @@ class PlayerService {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.queueOrderLabel.get",
     );
-    return queueSource == 'updates' ? '倒序（由旧到新）' : '队列顺序';
+    return queueSource == 'updates' ? '由旧到新' : '队列顺序';
   }
 
   bool playing = false, buffering = false;
@@ -237,6 +244,7 @@ class PlayerService {
   String? _completedTrackId;
   CloseSequence? _closeSteps;
   double? _pendingDurationPosition;
+  bool _pendingCloudResume = false;
   bool _manualChapterPosition = false;
   bool _sleepStopped = false, _manualPaused = false;
   int _savedAt = 0;
@@ -296,7 +304,7 @@ class PlayerService {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.loading.get",
     );
-    return _loading;
+    return _loading || _orderLoadingRequest != null;
   }
 
   // Policy warnings describe the current settings/duration. Do not retain one
@@ -341,12 +349,41 @@ class PlayerService {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.libraryIdentity.get",
     );
-    return accounts.activeClient?.identity ?? 'anonymous';
+    return _queueAccountIdentities[current?.id] ??
+        accounts.activeClient?.identity ??
+        'anonymous';
   }
 
-  String get _progressIdentity {
+  XmlyClient get currentClient {
     AppLog.instance.trace(
-      "lib/services/player_service.dart::PlayerService._progressIdentity.get",
+      "lib/services/player_service.dart::PlayerService.currentClient.get",
+    );
+
+    final identity = _queueAccountIdentities[current?.id];
+    if (identity == null) return accounts.activeClient ?? anonymous;
+    if (identity == 'anonymous') return anonymous;
+    try {
+      return accounts.clientFor(identity);
+    } on AccountException {
+      return anonymous;
+    }
+  }
+
+  XmlyClient _clientForIdentity(String? identity) {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService._clientForIdentity",
+    );
+
+    return identity == null
+        ? accounts.activeClient ?? anonymous
+        : identity == 'anonymous'
+        ? anonymous
+        : accounts.clientFor(identity);
+  }
+
+  String get playbackIdentity {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService.playbackIdentity.get",
     );
     return _source?.identity ?? libraryIdentity;
   }
@@ -356,8 +393,8 @@ class PlayerService {
       "lib/services/player_service.dart::PlayerService._historyClient.get",
     );
 
-    final identity = _source?.identity ?? accounts.activeClient?.identity;
-    if (identity == null || identity == 'anonymous') return null;
+    final identity = _source?.identity ?? libraryIdentity;
+    if (identity == 'anonymous') return null;
     try {
       return accounts.clientFor(identity);
     } catch (_) {
@@ -502,6 +539,7 @@ class PlayerService {
               'duplicate_page',
               'catalogue_changed',
               'queue_full',
+              'queue_changed',
             }.contains(failure.code);
     if (expected) return;
     AppLog.instance.requestUploadPrompt();
@@ -643,6 +681,7 @@ class PlayerService {
       });
     }
     _queue = restored.tracks;
+    _queueAccountIdentities = restored.accountIdentities;
     cursor = restored.cursor;
     sourceAlbumId = restored.sourceAlbumId;
     queueSource = restored.source;
@@ -712,41 +751,27 @@ class PlayerService {
       throw const XmlyException('catalogue_limit', '专辑播放队列最多 5000 集');
     }
     final tracks = result.tracks, offset = (page - 1) * xmlyAlbumPageSize;
+    final end = (offset + xmlyAlbumPageSize).clamp(0, result.total);
     if (result.page != page ||
         result.pageSize != xmlyAlbumPageSize ||
         result.album.id != album ||
-        tracks.length > xmlyAlbumPageSize ||
-        tracks.any((track) {
-          AppLog.instance.trace(
-            "lib/services/player_service.dart::PlayerService._albumPage.closure#1",
-          );
-          return track.albumId != album;
-        }) ||
-        tracks
-                .map((track) {
-                  AppLog.instance.trace(
-                    "lib/services/player_service.dart::PlayerService._albumPage.closure#2",
-                  );
-                  return track.id;
-                })
-                .toSet()
-                .length !=
-            tracks.length ||
-        (tracks.isNotEmpty &&
-            result.total > 0 &&
-            result.total < offset + tracks.length) ||
-        (tracks.length < xmlyAlbumPageSize &&
-            result.total > offset + tracks.length)) {
-      throw const XmlyException('invalid_album', '专辑分页不完整，请刷新重试');
+        tracks.length > (end - offset).clamp(0, xmlyAlbumPageSize)) {
+      throw const XmlyException('invalid_album', '专辑分页无效，请刷新重试');
     }
-    int? previousOrder;
-    for (var index = 0; index < tracks.length; index++) {
-      final track = tracks[index], order = xmlyPositive(tracks[index].orderNo);
-      if (track.officialPosition != offset + index + 1 ||
-          (previousOrder != null && order != null && order <= previousOrder)) {
+    final ids = <String>{};
+    var previousPosition = offset;
+    for (final track in tracks) {
+      xmlyIdentifier(track.id);
+      final position = track.officialPosition;
+      if (track.albumId != album ||
+          !ids.add(track.id) ||
+          position == null ||
+          position <= previousPosition ||
+          position > end ||
+          track.orderNo != position) {
         throw const XmlyException('invalid_album', '专辑分页顺序无效，请刷新重试');
       }
-      previousOrder = order ?? previousOrder;
+      previousPosition = position;
     }
     return result;
   }
@@ -759,6 +784,7 @@ class PlayerService {
     int? page,
     int? total,
     int pageSize = xmlyAlbumPageSize,
+    Map<String, String>? accountIdentities,
   }) async {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService._saveQueue",
@@ -777,8 +803,20 @@ class PlayerService {
         }
       }
     }
+    final albumIdentity = album.isNotEmpty && sourceAlbumId == album
+        ? _queueAccountIdentities[current?.id]
+        : null;
+    final owners =
+        accountIdentities ??
+        {
+          for (final track in tracks)
+            if (_queueAccountIdentities[track.id] ?? albumIdentity
+                case final identity?)
+              track.id: identity,
+        };
     final next = PlaybackQueue(
       tracks: tracks,
+      accountIdentities: owners,
       cursor: index,
       sourceAlbumId: album,
       source: source,
@@ -792,6 +830,7 @@ class PlayerService {
       );
       state['queue'] = next.toJson();
     });
+    _queueAccountIdentities = next.accountIdentities;
     queueSource = next.source;
     albumPage = next.albumPage;
     albumTotal = next.albumTotal;
@@ -815,9 +854,10 @@ class PlayerService {
     String albumId,
     String trackId, {
     int? page,
+    String? accountIdentity,
     Track? track,
     double? resumePosition,
-    ({double position, int updatedAt})? historyProgress,
+    ({double position, int updatedAt, bool fromCloud})? historyProgress,
   }) {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.playAlbum",
@@ -847,7 +887,7 @@ class PlayerService {
         );
       }
       final intent = ++generation, request = _newRequest();
-      final client = accounts.activeClient ?? anonymous;
+      final client = _clientForIdentity(accountIdentity);
       int? ordinalFor(Track? hint) {
         AppLog.instance.trace(
           "lib/services/player_service.dart::PlayerService.playAlbum.closure#1.ordinalFor",
@@ -899,7 +939,7 @@ class PlayerService {
         if (intent != generation ||
             request != _request ||
             accounts.admissionPaused ||
-            !identical(client, accounts.activeClient ?? anonymous))
+            !identical(client, _clientForIdentity(accountIdentity)))
           return;
         await _stopSource(localTarget: tracks[index]);
         await _saveQueue(
@@ -908,6 +948,10 @@ class PlayerService {
           album,
           page: selectedPage,
           total: result.total,
+          accountIdentities: {
+            if (accountIdentity != null)
+              for (final track in tracks) track.id: accountIdentity,
+          },
         );
         _queue = tracks;
         cursor = index;
@@ -923,7 +967,11 @@ class PlayerService {
 
   /// The visible feed is newest-first. Reverse that exact snapshot, preserving
   /// timestamp ties and mixed-album order; never reload an album to build it.
-  Future<void> playUpdates(List<Track> displayedLatestFirst, String trackId) {
+  Future<void> playUpdates(
+    List<Track> displayedLatestFirst,
+    String trackId, {
+    Map<String, String> accountIdentities = const {},
+  }) {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.playUpdates",
     );
@@ -971,7 +1019,13 @@ class PlayerService {
 
         if (request != _request) return;
         await _stopSource(localTarget: tracks[index]);
-        await _saveQueue(tracks, index, '', source: 'updates');
+        await _saveQueue(
+          tracks,
+          index,
+          '',
+          source: 'updates',
+          accountIdentities: accountIdentities,
+        );
         _queue = tracks;
         cursor = index;
         sourceAlbumId = '';
@@ -982,8 +1036,9 @@ class PlayerService {
 
   Future<void> playTrack(
     Track track, {
+    String? accountIdentity,
     double? resumePosition,
-    ({double position, int updatedAt})? historyProgress,
+    ({double position, int updatedAt, bool fromCloud})? historyProgress,
     bool manualPosition = false,
   }) {
     AppLog.instance.trace(
@@ -1013,7 +1068,14 @@ class PlayerService {
 
         if (request != _request) return;
         await _stopSource(localTarget: track);
-        await _saveQueue([track], 0, '');
+        await _saveQueue(
+          [track],
+          0,
+          '',
+          accountIdentities: {
+            if (accountIdentity != null) track.id: accountIdentity,
+          },
+        );
         _queue = [track];
         cursor = 0;
         sourceAlbumId = '';
@@ -1108,6 +1170,10 @@ class PlayerService {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.previous",
     );
+    final mode = effectiveSettings.loopMode;
+    if (mode == 'shuffle' || mode == 'all') {
+      return _advanceOrder(previous: true);
+    }
     return _run(() async {
       AppLog.instance.trace(
         "lib/services/player_service.dart::PlayerService.previous.closure#1",
@@ -1132,7 +1198,7 @@ class PlayerService {
       }
       final request = _newRequest(), intent = _advanceIntent;
       final expectedGeneration = generation, epoch = _epoch;
-      final album = sourceAlbumId, client = accounts.activeClient ?? anonymous;
+      final album = sourceAlbumId, client = currentClient;
       final snapshot = _queue;
       bool active() {
         AppLog.instance.trace(
@@ -1148,7 +1214,7 @@ class PlayerService {
             queueSource == 'album' &&
             sourceAlbumId == album &&
             !accounts.admissionPaused &&
-            identical(client, accounts.activeClient ?? anonymous);
+            identical(client, currentClient);
       }
 
       Future<AlbumPage> loadPage(int page) async {
@@ -1195,15 +1261,17 @@ class PlayerService {
         }
       }
       var added = anchorPage.tracks.take(anchor).toList();
-      if (added.isEmpty && page > 1) {
-        final preceding = await loadPage(page - 1);
+      for (
+        var precedingPage = page - 1;
+        added.isEmpty && precedingPage >= 1;
+        precedingPage--
+      ) {
+        final preceding = await loadPage(precedingPage);
         if (!active()) return;
-        added = preceding.tracks;
-        if (added.isEmpty ||
-            added.last.officialPosition !=
-                anchorPage.tracks.first.officialPosition! - 1) {
-          throw const XmlyException('invalid_album', '专辑前页不完整，请刷新后重试');
+        if (preceding.total != anchorPage.total) {
+          throw const XmlyException('catalogue_changed', '专辑总集数已变化，请刷新后重试');
         }
+        added = preceding.tracks;
       }
       if (added.isEmpty) {
         await replay();
@@ -1211,9 +1279,11 @@ class PlayerService {
       }
       final previousOrder = xmlyPositive(added.last.orderNo);
       final firstOrder = xmlyPositive(first.orderNo);
-      if (previousOrder != null &&
-          firstOrder != null &&
-          previousOrder >= firstOrder) {
+      if (added.last.officialPosition! >=
+              anchorPage.tracks[anchor].officialPosition! ||
+          (previousOrder != null &&
+              firstOrder != null &&
+              previousOrder >= firstOrder)) {
         throw const XmlyException('duplicate_page', '专辑分页重复或倒退，请刷新后重试');
       }
       await _commands.synchronized(() async {
@@ -1264,6 +1334,10 @@ class PlayerService {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.next",
     );
+    final mode = effectiveSettings.loopMode;
+    if (mode == 'shuffle' || mode == 'all') {
+      return _advanceOrder();
+    }
     return _run(() async {
       AppLog.instance.trace(
         "lib/services/player_service.dart::PlayerService.next.closure#1",
@@ -1317,6 +1391,342 @@ class PlayerService {
     });
   }
 
+  bool get _completeAlbumQueue {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService._completeAlbumQueue.get",
+    );
+
+    if (queueSource != 'album') return true;
+    final total = albumTotal, page = albumPage, size = albumPageSize;
+    if (_queue.isEmpty ||
+        total == null ||
+        page == null ||
+        size == null ||
+        page * size < total ||
+        (_queue.first.officialPosition ?? size + 1) > size) {
+      return false;
+    }
+    var previous = 0;
+    for (final track in _queue) {
+      final position = track.officialPosition;
+      if (position == null ||
+          position <= previous ||
+          position > total ||
+          track.orderNo != position ||
+          track.albumId != sourceAlbumId)
+        return false;
+      previous = position;
+    }
+    return true;
+  }
+
+  Future<void> _advanceOrder({
+    bool previous = false,
+    bool automatic = false,
+    int? expectedEpoch,
+    int? expectedIntent,
+  }) {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService._advanceOrder",
+    );
+
+    return _run(() async {
+      AppLog.instance.trace(
+        "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1",
+      );
+
+      final currentTrack = current;
+      if (currentTrack == null ||
+          (expectedEpoch != null && expectedEpoch != _epoch) ||
+          (expectedIntent != null && expectedIntent != _advanceIntent))
+        return;
+      final request = automatic ? _request : _newRequest();
+      final epoch = _epoch, intent = _advanceIntent, version = generation;
+      final mode = effectiveSettings.loopMode;
+      final album = sourceAlbumId, source = queueSource;
+      final client = currentClient;
+      bool active({bool stopped = false}) {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.active",
+        );
+
+        return !_closed &&
+            (stopped ? epoch + 1 : epoch) == _epoch &&
+            intent == _advanceIntent &&
+            request == _request &&
+            version == generation &&
+            current?.id == currentTrack.id &&
+            sourceAlbumId == album &&
+            queueSource == source &&
+            identical(client, currentClient) &&
+            effectiveSettings.loopMode == mode &&
+            !accounts.admissionPaused &&
+            (!automatic ||
+                (_atEnd &&
+                    !_manualPaused &&
+                    !_sleepStopping &&
+                    effectiveSettings.autoNext));
+      }
+
+      if (!active()) return;
+      var tracks = _queue;
+      var complete = _completeAlbumQueue;
+      var fetched = false;
+      var total = albumTotal;
+      if (!complete &&
+          (mode == 'shuffle' ||
+              (previous ? cursor == 0 : cursor + 1 >= _queue.length))) {
+        _orderLoadingRequest = request;
+        status = '正在加载完整专辑';
+        _notify();
+        try {
+          tracks = await _admission(request, () {
+            AppLog.instance.trace(
+              "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#1",
+            );
+
+            return client.withReadPolicy(
+              () async {
+                AppLog.instance.trace(
+                  "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#1.closure#1",
+                );
+                final first = await _albumPage(client, album, 1);
+                final values = <Track>[...first.tracks];
+                final ids = {for (final track in values) track.id};
+                total = first.total;
+                for (
+                  var page = 2;
+                  (page - 1) * xmlyAlbumPageSize < first.total;
+                  page++
+                ) {
+                  if (!active()) throw const DownloadStopped();
+                  final result = await _albumPage(client, album, page);
+                  if (result.total != first.total ||
+                      result.tracks.any((track) {
+                        AppLog.instance.trace(
+                          "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#1.closure#1.closure#1",
+                        );
+                        return !ids.add(track.id);
+                      })) {
+                    throw const XmlyException(
+                      'catalogue_changed',
+                      '专辑内容已变化，请刷新重试',
+                    );
+                  }
+                  values.addAll(result.tracks);
+                }
+                return values;
+              },
+              rateLimitRetries: 1,
+              cancelled: _requestChanged.future,
+              checkpoint: () async {
+                AppLog.instance.trace(
+                  "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#1.closure#2",
+                );
+
+                if (!active()) throw const DownloadStopped();
+              },
+            );
+          });
+        } catch (_) {
+          if (!active()) return;
+          rethrow;
+        } finally {
+          if (_orderLoadingRequest == request) {
+            _orderLoadingRequest = null;
+            if (status == '正在加载完整专辑') status = null;
+            _notify();
+          }
+        }
+        if (!active()) return;
+        final located = tracks.indexWhere((track) {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#2",
+          );
+
+          return track.id == currentTrack.id;
+        });
+        if (located < 0 ||
+            (currentTrack.officialPosition != null &&
+                tracks[located].officialPosition !=
+                    currentTrack.officialPosition)) {
+          throw const XmlyException('catalogue_changed', '专辑顺序已变化，请重新选择声音');
+        }
+        complete = true;
+        fetched = true;
+      }
+      await _commands.synchronized(() async {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#3",
+        );
+
+        if (!active()) return;
+        if (!fetched) {
+          tracks = _queue;
+          complete = _completeAlbumQueue;
+          total = albumTotal;
+        } else {
+          final last = _queue.last;
+          if (!tracks.any((track) {
+            AppLog.instance.trace(
+              "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#3.closure#1",
+            );
+
+            return track.id == last.id &&
+                track.officialPosition == last.officialPosition;
+          })) {
+            throw const XmlyException('catalogue_changed', '专辑内容已更新，请重试');
+          }
+        }
+        final sleep = policy.pollSleep();
+        if (sleep != null) {
+          await _sleep(sleep);
+          return;
+        }
+        final currentIndex = tracks.indexWhere((track) {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#3.closure#2",
+          );
+
+          return track.id == currentTrack.id;
+        });
+        if (currentIndex < 0) return;
+        final target = mode == 'shuffle'
+            ? _shuffle.pick(
+                [for (final track in tracks) track.id],
+                currentTrack.id,
+                previous: previous,
+              )
+            : tracks[(currentIndex + (previous ? -1 : 1)) % tracks.length].id;
+        final index = tracks.indexWhere((track) {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService._advanceOrder.closure#1.closure#3.closure#3",
+          );
+          return track.id == target;
+        });
+        await _stopSource(localTarget: tracks[index]);
+        if (!active(stopped: true)) return;
+        await _saveQueue(
+          tracks,
+          index,
+          album,
+          source: source,
+          page: album.isEmpty
+              ? null
+              : complete
+              ? (total! + xmlyAlbumPageSize - 1) ~/ xmlyAlbumPageSize
+              : albumPage,
+          total: album.isEmpty
+              ? null
+              : complete
+              ? total
+              : albumTotal,
+          pageSize: complete
+              ? xmlyAlbumPageSize
+              : albumPageSize ?? xmlyAlbumPageSize,
+        );
+        _queue = tracks;
+        cursor = index;
+        ++generation;
+        await _openCurrent(request, resumePosition: 0);
+      });
+    });
+  }
+
+  Future<void> setPlaybackMode(String mode) async {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService.setPlaybackMode",
+    );
+
+    if (!const {'off', 'single', 'all', 'shuffle'}.contains(mode)) {
+      throw const FormatException('播放方式无效');
+    }
+    if (_closed) throw StateError('播放器已关闭');
+    final album = current?.albumId;
+    ++_advanceIntent;
+    await storage.transaction((state) {
+      AppLog.instance.trace(
+        "lib/services/player_service.dart::PlayerService.setPlaybackMode.closure#1",
+      );
+
+      final settings = state['settings'] as Map;
+      final global = settings.putIfAbsent('playback', () {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService.setPlaybackMode.closure#1.closure#1",
+        );
+
+        return <String, dynamic>{};
+      }) as Map;
+      global['loopMode'] = mode;
+      global['autoNext'] = true;
+      final overrides = settings['albumOverrides'] as Map?;
+      final local = album == null ? null : overrides?[album] as Map?;
+      local?.remove('loopMode');
+      local?.remove('autoNext');
+    });
+    await applySettings(updateSource: false);
+  }
+
+  Future<void> setSkipSegments({
+    required int introSeconds,
+    required int outroSeconds,
+    String? albumId,
+    bool inherit = false,
+  }) async {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService.setSkipSegments",
+    );
+
+    if (_closed) throw StateError('播放器已关闭');
+    if (introSeconds < 0 ||
+        introSeconds > 3600 ||
+        outroSeconds < 0 ||
+        outroSeconds > 3600) {
+      throw const FormatException('跳过时长必须在 0–3600 秒之间');
+    }
+    final album = albumId == null ? null : xmlyIdentifier(albumId);
+    await storage.transaction((state) {
+      AppLog.instance.trace(
+        "lib/services/player_service.dart::PlayerService.setSkipSegments.closure#1",
+      );
+
+      final settings = state['settings'] as Map;
+      final global = settings.putIfAbsent('playback', () {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService.setSkipSegments.closure#1.closure#1",
+        );
+
+        return <String, dynamic>{};
+      }) as Map;
+      Map target = global;
+      if (album != null) {
+        final overrides = settings.putIfAbsent('albumOverrides', () {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService.setSkipSegments.closure#1.closure#2",
+          );
+
+          return <String, dynamic>{};
+        }) as Map;
+        target = overrides.putIfAbsent(album, () {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService.setSkipSegments.closure#1.closure#3",
+          );
+
+          return <String, dynamic>{};
+        }) as Map;
+      }
+      if (inherit && album != null) {
+        target.remove('skipIntroSeconds');
+        target.remove('skipOutroSeconds');
+      } else {
+        target['skipIntroSeconds'] = introSeconds;
+        target['skipOutroSeconds'] = outroSeconds;
+      }
+      PlaybackSettings.resolve(global, album == null ? const {} : target);
+    });
+    await applySettings(updateSource: false);
+  }
+
   Future<void> replay() {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.replay",
@@ -1346,7 +1756,7 @@ class PlayerService {
     );
 
     final library =
-        (storage.state['library'] as Map)[identity ?? _progressIdentity];
+        (storage.state['library'] as Map)[identity ?? playbackIdentity];
     final progress = library is Map ? library['playbackProgress'] : null;
     final entry = progress is Map ? progress[track.id] : null;
     if (entry is! Map) return null;
@@ -1393,7 +1803,7 @@ class PlayerService {
     final client = _historyClient;
     if (client == null || !client.accountAvailable) return;
     final identity = client.cacheIdentity;
-    final listener = accounts.activeClient;
+    final listener = currentClient;
     final revision = _seekRevision;
     bool sameSource() {
       AppLog.instance.trace(
@@ -1412,7 +1822,7 @@ class PlayerService {
           current?.id == track.id &&
           revision == _seekRevision &&
           !accounts.admissionPaused &&
-          identical(listener, accounts.activeClient) &&
+          identical(listener, currentClient) &&
           identical(client, _historyClient) &&
           identity == client.cacheIdentity;
     }
@@ -1449,6 +1859,7 @@ class PlayerService {
               duration: duration,
               resumePosition: (remote['position'] as num).toDouble(),
               settings: effectiveSettings,
+              cloudResume: true,
             );
             await _driver.seek(restored);
             if (!active()) return;
@@ -1456,6 +1867,7 @@ class PlayerService {
             position = restored;
             if (_pendingDurationPosition != null) {
               _pendingDurationPosition = restored;
+              _pendingCloudResume = true;
             }
             // Only a subsequent device observation may persist the restored
             // position; the pre-seek fallback is not an official observation.
@@ -1485,7 +1897,7 @@ class PlayerService {
   Future<void> _openCurrent(
     int request, {
     double? resumePosition,
-    ({double position, int updatedAt})? historyProgress,
+    ({double position, int updatedAt, bool fromCloud})? historyProgress,
     bool manualReplay = false,
     bool startPlaying = true,
     String? localTaskId,
@@ -1522,7 +1934,7 @@ class PlayerService {
   Future<void> _openCurrentSource(
     int request, {
     double? resumePosition,
-    ({double position, int updatedAt})? historyProgress,
+    ({double position, int updatedAt, bool fromCloud})? historyProgress,
     bool manualReplay = false,
     bool startPlaying = true,
     String? localTaskId,
@@ -1585,8 +1997,9 @@ class PlayerService {
     }
     _source = source;
     var knownProgress = _localProgress(track);
-    // The history page already has a dated cloud observation. Keep it when
-    // a fresh query fails, without replacing newer local or remote progress.
+    var cloudResume = false;
+    // Keep the album/history page's dated observation when a fresh cloud query
+    // fails, without replacing newer local or remote progress.
     if (historyProgress != null &&
         historyProgress.position.isFinite &&
         historyProgress.position >= 0 &&
@@ -1594,7 +2007,11 @@ class PlayerService {
         historyProgress.updatedAt >= 0 &&
         (knownProgress == null ||
             historyProgress.updatedAt > knownProgress.updatedAt)) {
-      knownProgress = historyProgress;
+      knownProgress = (
+        position: historyProgress.position,
+        updatedAt: historyProgress.updatedAt,
+      );
+      cloudResume = saved == null && historyProgress.fromCloud;
     }
     try {
       final resume = saved ?? knownProgress?.position ?? 0.0;
@@ -1620,8 +2037,10 @@ class PlayerService {
         resumePosition: resume,
         settings: settings,
         manualReplay: manualReplay,
+        cloudResume: cloudResume,
       );
       _pendingDurationPosition = duration <= 0 ? position : null;
+      _pendingCloudResume = cloudResume;
       rate = settings.speed;
       volume = settings.outputVolume;
       await _driver.open(source.uri, epoch: epoch, startPosition: position);
@@ -1885,7 +2304,9 @@ class PlayerService {
         }
         _sourceWarning = '边听边下按整集预扣听时，已产生的在线听时不会抵扣';
         _notify();
-        final batch = await prepare([track]);
+        final batch = await prepare([
+          track,
+        ], accountIdentity: _queueAccountIdentities[track.id]);
         if (request != _request || !await confirm(batch)) {
           throw const XmlyException('cancelled', '已取消边听边下');
         }
@@ -2026,7 +2447,7 @@ class PlayerService {
 
         if (request != _request) return;
         await _stopSource(localTarget: task.track);
-        await _saveQueue([task.track], 0, '');
+        await _saveQueue([task.track], 0, '', accountIdentities: const {});
         _queue = [task.track];
         cursor = 0;
         sourceAlbumId = '';
@@ -2120,7 +2541,7 @@ class PlayerService {
           );
           return;
         }
-        _official.start('player', current!, _progressIdentity);
+        _official.start('player', current!, playbackIdentity);
         _sleepStopped = false;
         _manualPaused = false;
         await _driver.play();
@@ -2185,6 +2606,7 @@ class PlayerService {
         position = policy.manualSeek(seconds);
         if (_pendingDurationPosition != null) {
           _pendingDurationPosition = position;
+          _pendingCloudResume = false;
         }
         await _driver.seek(position);
         if (_atEnd) {
@@ -2256,7 +2678,8 @@ class PlayerService {
         snapshot.duration <= 0 ||
         snapshot.position / snapshot.duration <= 0.8 ||
         cursor < 0 ||
-        effectiveSettings.loopMode == 'single' ||
+        !effectiveSettings.autoNext ||
+        const {'single', 'shuffle'}.contains(effectiveSettings.loopMode) ||
         policy.sleepWaitingForEnd ||
         policy.sleepRequest?.mode == SleepMode.endOfTrack ||
         _prefetchFlight != null ||
@@ -2264,7 +2687,7 @@ class PlayerService {
         (_prefetchEpoch == _epoch && _prefetchGeneration == generation))
       return;
     final epoch = _epoch, expectedGeneration = generation, request = _request;
-    final advanceIntent = _advanceIntent;
+    final advanceIntent = _advanceIntent, mode = effectiveSettings.loopMode;
     final quality = (_settings['download'] as Map?)?['quality'] as String?;
     _prefetchEpoch = epoch;
     _prefetchGeneration = expectedGeneration;
@@ -2280,6 +2703,7 @@ class PlayerService {
           epoch == _epoch &&
           advanceIntent == _advanceIntent &&
           expectedGeneration == generation &&
+          effectiveSettings.loopMode == mode &&
           identical(_source, source) &&
           !accounts.admissionPaused;
     }
@@ -2336,6 +2760,7 @@ class PlayerService {
   Future<void> _observe(
     AudioSnapshot snapshot, {
     required int seekRevision,
+    required int advanceIntent,
     bool stateAlreadyRecorded = false,
   }) async {
     AppLog.instance.trace(
@@ -2355,7 +2780,8 @@ class PlayerService {
     }
     // Billing captured the event at arrival; stale pre-seek positions must not
     // become fresh local/cloud progress when the command queue catches up.
-    if (seekRevision != _seekRevision) return;
+    if (seekRevision != _seekRevision || advanceIntent != _advanceIntent)
+      return;
     if (!snapshot.position.isFinite ||
         snapshot.position < 0 ||
         !snapshot.duration.isFinite ||
@@ -2373,17 +2799,29 @@ class PlayerService {
     final pendingPosition = _pendingDurationPosition;
     if (pendingPosition != null && duration > 0) {
       _pendingDurationPosition = null;
+      final cloudResume = _pendingCloudResume;
+      _pendingCloudResume = false;
       // Opening may report zero after the requested resume seek was issued.
       // Keep that target, or newer playback progress, when applying chapter skips.
       final resume = position < pendingPosition ? pendingPosition : position;
       final initial = policy.start(
         duration: duration,
-        resumePosition: resume,
+        resumePosition: cloudResume ? pendingPosition : resume,
         settings: effectiveSettings,
         manualReplay: _manualChapterPosition,
+        cloudResume: cloudResume,
       );
-      position = initial;
-      if (initial != resume) await _driver.seek(initial);
+      position = cloudResume && initial >= pendingPosition && initial < resume
+          ? resume
+          : initial;
+      if (position != resume) {
+        await _driver.seek(position);
+        ++_seekRevision;
+        _actual = false;
+        _observedAt = 0;
+        _notify();
+        return;
+      }
     }
     if (playing && !buffering) _actual = true;
     await ledger.observe(
@@ -2403,13 +2841,21 @@ class PlayerService {
       await _sleep(sleep);
       return;
     }
+    if (seekRevision != _seekRevision || advanceIntent != _advanceIntent) {
+      _notify();
+      return;
+    }
     // Opening/seeking can emit a paused position before the first real play.
     // Such a snapshot must not consume this chapter's completion event.
     final finished = policy.observe(
       position,
       duration: duration,
       completed: snapshot.completed,
-      allowCompletion: _actual,
+      allowCompletion:
+          _actual &&
+          !_manualPaused &&
+          !_sleepStopping &&
+          (snapshot.playing || snapshot.completed),
     );
     if (finished && !_atEnd)
       await _finish();
@@ -2488,6 +2934,22 @@ class PlayerService {
       await _openCurrent(_newRequest(), resumePosition: 0);
       return;
     }
+    final mode = effectiveSettings.loopMode;
+    if (effectiveSettings.autoNext && (mode == 'shuffle' || mode == 'all')) {
+      final epoch = _epoch;
+      _background(() {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService._finish.closure#1",
+        );
+
+        return _advanceOrder(
+          automatic: true,
+          expectedEpoch: epoch,
+          expectedIntent: intent,
+        );
+      });
+      return;
+    }
     if (queueSource == 'album' &&
         cursor == _queue.length - 1 &&
         sourceAlbumId.isNotEmpty &&
@@ -2502,7 +2964,7 @@ class PlayerService {
         final expectedGeneration = generation, album = sourceAlbumId;
         unawaited(() async {
           AppLog.instance.trace(
-            "lib/services/player_service.dart::PlayerService._finish.closure#1",
+            "lib/services/player_service.dart::PlayerService._finish.closure#2",
           );
 
           try {
@@ -2558,7 +3020,7 @@ class PlayerService {
       return _tailFlight!;
     }
     final endEpoch = _epoch, advanceIntent = _advanceIntent;
-    final client = accounts.activeClient ?? anonymous, snapshot = _queue;
+    final client = currentClient, snapshot = _queue;
     final savedPage = albumPage, savedTotal = albumTotal;
     final savedSize = albumPageSize;
     if (current?.id == snapshot.last.id) _checkedEpochs.add(endEpoch);
@@ -2572,7 +3034,7 @@ class PlayerService {
           queueSource == 'album' &&
           sourceAlbumId == album &&
           !accounts.admissionPaused &&
-          identical(client, accounts.activeClient ?? anonymous);
+          identical(client, currentClient);
     }
 
     _tailGeneration = expectedGeneration;
@@ -2597,9 +3059,7 @@ class PlayerService {
           );
 
           if ((savedPage != null &&
-                  (savedSize == null ||
-                      position <= (savedPage - 1) * savedSize ||
-                      position > savedPage * savedSize)) ||
+                  (savedSize == null || position > savedPage * savedSize)) ||
               snapshot.any((track) {
                 AppLog.instance.trace(
                   "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.validateBoundary.closure#1",
@@ -2616,7 +3076,7 @@ class PlayerService {
         // A persisted 50-row page number is never a 200-row page number.
         if (officialPosition != null) validateBoundary(officialPosition);
         var loadedPage = (candidate - 1) ~/ xmlyAlbumPageSize + 1;
-        var loadedCount = (candidate - 1) % xmlyAlbumPageSize + 1;
+        final withinPage = (candidate - 1) % xmlyAlbumPageSize + 1;
         var total = savedTotal ?? 0;
         final known = snapshot.map((track) {
               AppLog.instance.trace(
@@ -2626,6 +3086,7 @@ class PlayerService {
             }).toSet(),
             added = <Track>[];
         var previousOrder = xmlyPositive(last.orderNo);
+        var previousPosition = candidate;
         void append(AlbumPage result, {required bool samePage}) {
           AppLog.instance.trace(
             "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.append",
@@ -2639,15 +3100,23 @@ class PlayerService {
               );
               return track.id == last.id;
             });
-            if (anchor != loadedCount - 1) {
+            if (anchor < 0 ||
+                (officialPosition != null &&
+                    result.tracks[anchor].officialPosition !=
+                        officialPosition)) {
               throw const XmlyException('catalogue_changed', '专辑末页发生变化，请刷新后重试');
             }
-            final retained = snapshot.length < loadedCount
+            previousPosition = result.tracks[anchor].officialPosition!;
+            validateBoundary(previousPosition);
+            final retained = snapshot.length < anchor + 1
                 ? snapshot.length
-                : loadedCount;
+                : anchor + 1;
             for (var index = 0; index < retained; index++) {
-              if (snapshot[snapshot.length - retained + index].id !=
-                  result.tracks[loadedCount - retained + index].id) {
+              final old = snapshot[snapshot.length - retained + index];
+              final fresh = result.tracks[anchor + 1 - retained + index];
+              if (old.id != fresh.id ||
+                  (old.officialPosition != null &&
+                      old.officialPosition != fresh.officialPosition)) {
                 throw const XmlyException(
                   'catalogue_changed',
                   '专辑末页发生变化，请刷新后重试',
@@ -2656,9 +3125,13 @@ class PlayerService {
             }
             start = anchor + 1;
           }
+          if (result.total < previousPosition) {
+            throw const XmlyException('catalogue_changed', '专辑总集数已变化，请刷新重试');
+          }
           for (final track in result.tracks.skip(start)) {
             final order = xmlyPositive(track.orderNo);
             if (!known.add(track.id) ||
+                track.officialPosition! <= previousPosition ||
                 (previousOrder != null &&
                     order != null &&
                     order <= previousOrder!)) {
@@ -2666,9 +3139,10 @@ class PlayerService {
             }
             added.add(track);
             previousOrder = order ?? previousOrder;
+            previousPosition = track.officialPosition!;
           }
-          if (result.tracks.length > start) loadedPage = result.page;
-          if (result.total > 0) total = result.total;
+          loadedPage = result.page;
+          total = result.total;
           if (snapshot.length + added.length > 5000) {
             throw const XmlyException('catalogue_limit', '专辑播放队列最多 5000 集');
           }
@@ -2678,7 +3152,7 @@ class PlayerService {
         // Without an official position, orderNo selects only a candidate page.
         final samePage =
             officialPosition == null ||
-            loadedCount < xmlyAlbumPageSize ||
+            withinPage < xmlyAlbumPageSize ||
             loadedPage == 5000 ~/ xmlyAlbumPageSize;
         final page = samePage ? loadedPage : loadedPage + 1;
         final result = await _admission(request, () {
@@ -2688,41 +3162,25 @@ class PlayerService {
           return _albumPage(client, album, page);
         });
         if (!active()) return;
-        if (officialPosition == null) {
-          final anchor = result.tracks.indexWhere((track) {
+        append(result, samePage: samePage);
+        while (loadedPage * xmlyAlbumPageSize < total &&
+            (added.isEmpty || samePage && loadedPage == page)) {
+          final nextPage = loadedPage + 1;
+          final following = await _admission(request, () {
             AppLog.instance.trace(
               "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#3",
             );
-            return track.id == last.id;
-          });
-          if (anchor < 0) {
-            throw const XmlyException(
-              'catalogue_changed',
-              '此页没有找到队列末集，请从专辑页重新选择声音',
-            );
-          }
-          loadedCount = anchor + 1;
-          validateBoundary((page - 1) * xmlyAlbumPageSize + loadedCount);
-        }
-        append(result, samePage: samePage);
-        if (samePage &&
-            result.tracks.length == xmlyAlbumPageSize &&
-            result.total > page * xmlyAlbumPageSize) {
-          final following = await _admission(request, () {
-            AppLog.instance.trace(
-              "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#4",
-            );
-            return _albumPage(client, album, page + 1);
+            return _albumPage(client, album, nextPage);
           });
           if (!active()) return;
-          if (following.tracks.isEmpty && following.total == 0) {
-            throw const XmlyException('invalid_album', '专辑分页未能继续，请刷新后重试');
+          if (following.total != total) {
+            throw const XmlyException('catalogue_changed', '专辑总集数已变化，请刷新重试');
           }
           append(following, samePage: false);
         }
         await _commands.synchronized(() async {
           AppLog.instance.trace(
-            "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#5",
+            "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#4",
           );
 
           if (!active()) return;
@@ -2753,7 +3211,7 @@ class PlayerService {
               !_sleepStopping &&
               !_manualPaused &&
               effectiveSettings.autoNext &&
-              effectiveSettings.loopMode != 'single') {
+              effectiveSettings.loopMode == 'off') {
             final sleep = policy.onChapterEnd() ?? policy.pollSleep();
             if (sleep != null) {
               await _sleep(sleep);
@@ -2761,7 +3219,7 @@ class PlayerService {
             }
             await _run(() {
               AppLog.instance.trace(
-                "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#5.closure#1",
+                "lib/services/player_service.dart::PlayerService.refreshAlbumTail.closure#1.closure#4.closure#1",
               );
               return _select(cursor + 1, _newRequest());
             });
@@ -2884,7 +3342,7 @@ class PlayerService {
     final track = current;
     if (track == null || _source == null || !_actual) return;
     final actualPosition = _observedPosition;
-    final identity = _progressIdentity;
+    final identity = playbackIdentity;
     final observedAt = _observedAt;
     final previous = _localProgress(track);
     if (actualPosition.isFinite &&
@@ -3009,6 +3467,11 @@ class PlayerService {
         );
 
         final settings = effectiveSettings;
+        if (_appliedLoopMode != settings.loopMode) {
+          ++_advanceIntent;
+          _shuffle.reset();
+          _appliedLoopMode = settings.loopMode;
+        }
         if (AppLog.instance.level == AppLogLevel.debug) {
           _command('applySettings', {
             'updateSource': updateSource,
@@ -3023,6 +3486,17 @@ class PlayerService {
         final wasDownload = sourceKind == 'prepaid' || sourceKind == 'local';
         policy.updateSettings(settings);
         await ledger.sampleCurrentState();
+        if (_source != null && !_atEnd) {
+          final intro = policy.introSeekPosition(position);
+          if (intro != null) {
+            await _driver.seek(intro);
+            position = intro;
+            ++_seekRevision;
+            _cloudResumeEpoch = null;
+            if (_pendingDurationPosition != null)
+              _pendingDurationPosition = intro;
+          }
+        }
         await _driver.setRate(settings.speed);
         rate = settings.speed;
         await ledger.sampleCurrentState(speed: rate);
@@ -3047,7 +3521,7 @@ class PlayerService {
     });
   }
 
-  Future<void> playNext(Track track) {
+  Future<void> playNext(Track track, {String? accountIdentity}) {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.playNext",
     );
@@ -3084,7 +3558,15 @@ class PlayerService {
         });
         next.insert(index + 1, target);
         final cursorIndex = index < 0 ? 0 : index;
-        await _saveQueue(next, cursorIndex, '');
+        await _saveQueue(
+          next,
+          cursorIndex,
+          '',
+          accountIdentities: {
+            ..._queueAccountIdentities,
+            if (accountIdentity != null) track.id: accountIdentity,
+          },
+        );
         _queue = next;
         cursor = cursorIndex;
         if (selected == null) duration = current?.duration ?? 0;
@@ -3095,7 +3577,7 @@ class PlayerService {
     });
   }
 
-  Future<void> addToQueue(Track track) {
+  Future<void> addToQueue(Track track, {String? accountIdentity}) {
     AppLog.instance.trace(
       "lib/services/player_service.dart::PlayerService.addToQueue",
     );
@@ -3125,7 +3607,15 @@ class PlayerService {
         if (_queue.length >= 5000)
           throw const XmlyException('queue_full', '队列最多 5000 集');
         final next = [..._queue, track], index = cursor < 0 ? 0 : cursor;
-        await _saveQueue(next, index, '');
+        await _saveQueue(
+          next,
+          index,
+          '',
+          accountIdentities: {
+            ..._queueAccountIdentities,
+            if (accountIdentity != null) track.id: accountIdentity,
+          },
+        );
         _queue = next;
         cursor = index;
         if (selected == null) duration = current?.duration ?? 0;
@@ -3259,6 +3749,105 @@ class PlayerService {
         cursor = index;
         sourceAlbumId = '';
         ++generation;
+        _notify();
+      });
+    });
+  }
+
+  Future<void> reverseQueue() {
+    AppLog.instance.trace(
+      "lib/services/player_service.dart::PlayerService.reverseQueue",
+    );
+
+    return _run(() async {
+      AppLog.instance.trace(
+        "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1",
+      );
+
+      if (_queue.isEmpty) return;
+      final selected = current!;
+      final version = generation, epoch = _epoch, request = _request;
+      final advanceIntent = _advanceIntent;
+      final client = currentClient, identity = libraryIdentity;
+      final album = sourceAlbumId, source = queueSource;
+      bool active() {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1.active",
+        );
+
+        return !_closed &&
+            version == generation &&
+            epoch == _epoch &&
+            request == _request &&
+            current?.id == selected.id &&
+            sourceAlbumId == album &&
+            queueSource == source &&
+            identical(client, currentClient) &&
+            !accounts.admissionPaused;
+      }
+
+      var tracks = _queue;
+      if (!_completeAlbumQueue) {
+        // Reversing a paged album must include chapters outside the loaded page.
+        tracks = await client.withReadPolicy(
+          () {
+            AppLog.instance.trace(
+              "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1.closure#1",
+            );
+            return XmlyCatalogue(client).album(album);
+          },
+          rateLimitRetries: 0,
+          cancelled: _requestChanged.future,
+          checkpoint: () async {
+            AppLog.instance.trace(
+              "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1.closure#2",
+            );
+
+            if (!active()) throw const DownloadStopped();
+          },
+        );
+      }
+      await _commands.synchronized(() async {
+        AppLog.instance.trace(
+          "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1.closure#3",
+        );
+
+        if (!active()) {
+          throw const XmlyException('queue_changed', '播放列表已变化，请重新排序');
+        }
+        final byId = {for (final track in tracks) track.id: track};
+        for (final track in _queue) {
+          final candidate = byId[track.id];
+          if (candidate == null ||
+              (source == 'album' &&
+                  track.officialPosition != null &&
+                  candidate.officialPosition != track.officialPosition)) {
+            throw const XmlyException('catalogue_changed', '专辑内容已更新，请重试');
+          }
+        }
+        final next = tracks.reversed.toList();
+        final index = next.indexWhere((track) {
+          AppLog.instance.trace(
+            "lib/services/player_service.dart::PlayerService.reverseQueue.closure#1.closure#3.closure#1",
+          );
+          return track.id == selected.id;
+        });
+        final owners = {
+          for (final track in next)
+            if (_queueAccountIdentities[track.id] ??
+                    (source == 'album' ? identity : null)
+                case final owner?)
+              track.id: owner,
+        };
+        // As with dragging, an explicit reorder becomes a complete custom queue.
+        await _saveQueue(next, index, '', accountIdentities: owners);
+        _queue = next;
+        cursor = index;
+        sourceAlbumId = '';
+        // A newer playback request may arrive while storage commits the queue.
+        if (generation == version) ++generation;
+        if (_advanceIntent == advanceIntent) ++_advanceIntent;
+        _shuffle.reset();
         _notify();
       });
     });
@@ -3427,6 +4016,7 @@ class PlayerService {
     buffering = false;
     _actual = false;
     _pendingDurationPosition = null;
+    _pendingCloudResume = false;
   }
 
   Future<void> stopTaskReference(String taskId) async {

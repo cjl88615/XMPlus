@@ -161,7 +161,7 @@ class _ShellPageState extends State<ShellPage> {
   }
 
   static const _destinations = [
-    (label: '主页', icon: Icons.home_outlined, selected: Icons.home),
+    (label: '发现', icon: Icons.home_outlined, selected: Icons.home),
     (label: '听过', icon: Icons.headphones_outlined, selected: Icons.headphones),
     (label: '下载', icon: Icons.download_outlined, selected: Icons.download),
     (label: '设置', icon: Icons.settings_outlined, selected: Icons.settings),
@@ -524,7 +524,11 @@ class _ShellPageStackState extends State<_ShellPageStack> {
                         );
                         _finishTransition(index);
                       },
-                      child: RepaintBoundary(child: widget.children[index]),
+                      child: RepaintBoundary(
+                        // Keep portal children under the same visibility and
+                        // semantics gates as their page while it fades out.
+                        child: Overlay.wrap(child: widget.children[index]),
+                      ),
                     ),
                   ),
                 ),

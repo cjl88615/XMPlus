@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:file_picker/file_picker.dart';
 
+import '../common/widgets/app_scrollbar.dart';
 import '../common/widgets/adaptive_text.dart';
 import '../services/app_runtime.dart';
 import '../services/app_log.dart';
@@ -180,11 +181,14 @@ Future<({String identity, bool polling})?> _chooseDownloadAccount(
 Future<void> requestDownloads(
   BuildContext context,
   AppRuntime runtime,
-  List<Track> tracks,
-) async {
+  List<Track> tracks, {
+  String? accountIdentity,
+}) async {
   AppLog.instance.trace("lib/pages/download_page.dart::requestDownloads");
 
-  final account = await _chooseDownloadAccount(context, runtime);
+  final account = accountIdentity == null
+      ? await _chooseDownloadAccount(context, runtime)
+      : (identity: accountIdentity, polling: false);
   if (account == null || !context.mounted) return;
   final batch = await runtime.prepareDownloads(
     tracks,
@@ -204,11 +208,14 @@ Future<void> requestDownloads(
 Future<void> requestAlbumDownloads(
   BuildContext context,
   AppRuntime runtime,
-  String albumId,
-) async {
+  String albumId, {
+  String? accountIdentity,
+}) async {
   AppLog.instance.trace("lib/pages/download_page.dart::requestAlbumDownloads");
 
-  final account = await _chooseDownloadAccount(context, runtime);
+  final account = accountIdentity == null
+      ? await _chooseDownloadAccount(context, runtime)
+      : (identity: accountIdentity, polling: false);
   if (account == null || !context.mounted) return;
   final batch = await runtime.prepareAlbumDownloads(
     albumId,
@@ -492,7 +499,7 @@ Future<bool> confirmDownloadBatch(
                   if (batch.items.isNotEmpty)
                     SizedBox(
                       height: (batch.items.length * 72.0).clamp(72.0, 260.0),
-                      child: Scrollbar(
+                      child: AppScrollbar(
                         child: ListView.builder(
                           itemCount: batch.items.length,
                           itemBuilder: (_, index) {
@@ -1253,7 +1260,7 @@ class _DownloadPageState extends State<DownloadPage> {
     }
   }
 
-  Widget _taskList(List<DownloadTask> tasks) {
+  Widget _taskList(List<DownloadTask> tasks, List<DownloadTask> completed) {
     AppLog.instance.trace(
       'lib/pages/download_page.dart::_DownloadPageState._taskList',
     );
@@ -1276,6 +1283,7 @@ class _DownloadPageState extends State<DownloadPage> {
       for (final job in allJobs)
         for (final id in job.taskIds) id: job.id,
     };
+    final completedIds = {for (final task in completed) task.id};
     final jobTasks = <String, List<DownloadTask>>{};
     final standalone = <DownloadTask>[];
     for (final task in visible) {
@@ -1480,7 +1488,7 @@ class _DownloadPageState extends State<DownloadPage> {
               ),
             ),
             Expanded(
-              child: Scrollbar(
+              child: AppScrollbar(
                 child: ListView.builder(
                   key: const PageStorageKey('compact-download-tasks'),
                   itemCount: jobs.length + standalone.length,
@@ -1493,6 +1501,9 @@ class _DownloadPageState extends State<DownloadPage> {
                             jobs[index],
                             jobTasks[jobs[index].id] ?? const [],
                             compact,
+                            jobs[index].taskIds
+                                .where(completedIds.contains)
+                                .length,
                           )
                         : _taskCard(standalone[index - jobs.length], compact);
                   },
@@ -1505,95 +1516,174 @@ class _DownloadPageState extends State<DownloadPage> {
     );
   }
 
+  String _downloadAccountLabel(String identity) {
+    AppLog.instance.trace(
+      'lib/pages/download_page.dart::_DownloadPageState._downloadAccountLabel',
+    );
+    if (identity == 'anonymous') return '不登录（免费内容）';
+    final record =
+        (widget.runtime.storage.state['accounts'] as Map)[identity] as Map?;
+    final uid = record?['uid'];
+    return uid == null ? '原账号' : '账号 $uid';
+  }
+
+  Future<void> _showAlbumJobDetails(DownloadAlbumJob job) {
+    AppLog.instance.trace(
+      'lib/pages/download_page.dart::_DownloadPageState._showAlbumJobDetails',
+    );
+    return showDialog<void>(
+      context: context,
+      builder: (context) {
+        AppLog.instance.trace(
+          'lib/pages/download_page.dart::_DownloadPageState._showAlbumJobDetails.closure#1',
+        );
+        return AlertDialog(
+          scrollable: true,
+          title: const Text('任务详情'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(job.title),
+              const SizedBox(height: 8),
+              Text(_downloadAccountLabel(job.accountIdentity)),
+              const SizedBox(height: 8),
+              SelectableText('目录：${job.rootDirectory}'),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                AppLog.instance.trace(
+                  'lib/pages/download_page.dart::_DownloadPageState._showAlbumJobDetails.closure#1.closure#1',
+                );
+                Navigator.pop(context);
+              },
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _albumJobCard(
     DownloadAlbumJob job,
     List<DownloadTask> tasks,
     bool compact,
+    int completed,
   ) {
     AppLog.instance.trace(
       'lib/pages/download_page.dart::_DownloadPageState._albumJobCard',
     );
+    final state = switch (job.state) {
+      'queued' => '等待下载',
+      'running' => '下载中',
+      'paused' => '已暂停',
+      'failed' => '下载失败',
+      'completed' => '已结束',
+      'cancelled' => '已取消',
+      _ => '状态未知',
+    };
     return ExpansionTile(
       key: PageStorageKey('download-album-job:${job.id}'),
       minTileHeight: 48,
-      title: Text(job.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-      children: [
-        Text('整专辑 · ${job.state} · 第 ${job.page} 页 / ${job.total} 集'),
-        if (job.error != null)
+      tilePadding: EdgeInsets.symmetric(horizontal: compact ? 8 : 16),
+      title: Text(job.title, maxLines: 2, overflow: TextOverflow.ellipsis),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('整专辑 · $state'),
           Text(
-            job.error!,
-            style: TextStyle(color: Theme.of(context).colorScheme.error),
+            '本次完成 $completed 集'
+            '${job.total > 0 ? ' · 专辑共 ${job.total} 集' : ''}',
           ),
-        AdaptiveText('账号：${job.accountIdentity}'),
-        AdaptiveText('目录：${job.rootDirectory}'),
-        Wrap(
-          spacing: 8,
-          runSpacing: 4,
-          children: [
-            for (final (label, action) in <(String, Future<void> Function())>[
-              if (job.state == 'running')
-                (
-                  '暂停专辑',
-                  () {
-                    AppLog.instance.trace(
-                      "lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#1",
-                    );
-                    return _service.pauseAlbum(job.id);
-                  },
-                ),
-              if (job.state != 'running')
-                (
-                  '继续专辑',
-                  () {
-                    AppLog.instance.trace(
-                      "lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#2",
-                    );
-                    return _service.resumeAlbum(job.id);
-                  },
-                ),
-              if (job.state != 'running')
-                (
-                  '刷新专辑',
-                  () {
-                    AppLog.instance.trace(
-                      "lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#3",
-                    );
-                    return _service.refreshAlbum(job.id);
-                  },
-                ),
-              (
-                '取消专辑任务',
-                () {
-                  AppLog.instance.trace(
-                    "lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#4",
-                  );
-                  return _cancelAlbum(job.id);
-                },
-              ),
-            ])
-              TextButton(
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              TextButton.icon(
                 style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
                 onPressed: _downloadActionsBlocked
                     ? null
                     : () {
                         AppLog.instance.trace(
-                          "lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#5",
+                          'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#1',
                         );
-                        _run(action);
+                        _run(() {
+                          AppLog.instance.trace(
+                            'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#1.closure#1',
+                          );
+                          return job.state == 'running'
+                              ? _service.pauseAlbum(job.id)
+                              : _service.resumeAlbum(job.id);
+                        });
                       },
-                child: Text(label),
+                icon: Icon(
+                  job.state == 'running' ? Icons.pause : Icons.download,
+                ),
+                label: Text(job.state == 'running' ? '暂停' : '继续'),
               ),
-          ],
-        ),
+              PopupMenuButton<String>(
+                enabled: !_downloadActionsBlocked,
+                tooltip: '专辑任务操作',
+                onSelected: (action) {
+                  AppLog.instance.trace(
+                    'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#2',
+                  );
+                  _run(() async {
+                    AppLog.instance.trace(
+                      'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#2.closure#1',
+                    );
+                    switch (action) {
+                      case 'details':
+                        await _showAlbumJobDetails(job);
+                      case 'refresh':
+                        await _service.refreshAlbum(job.id);
+                      case 'cancel':
+                        await _cancelAlbum(job.id);
+                    }
+                  });
+                },
+                itemBuilder: (_) {
+                  AppLog.instance.trace(
+                    'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#3',
+                  );
+                  return [
+                    const PopupMenuItem(value: 'details', child: Text('任务详情')),
+                    if (job.state != 'running')
+                      const PopupMenuItem(
+                        value: 'refresh',
+                        child: Text('刷新专辑'),
+                      ),
+                    const PopupMenuItem(value: 'cancel', child: Text('取消专辑任务')),
+                  ];
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+      children: [
+        if (job.error != null)
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 16),
+            child: Text(
+              job.error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
         if (tasks.isNotEmpty)
           SizedBox(
             height: (tasks.length * 48.0).clamp(48.0, 400.0).toDouble(),
             child: ListView.builder(
+              key: PageStorageKey('download-album-job-tasks:${job.id}'),
               primary: false,
               itemCount: tasks.length,
               itemBuilder: (_, index) {
                 AppLog.instance.trace(
-                  'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#6',
+                  'lib/pages/download_page.dart::_DownloadPageState._albumJobCard.closure#4',
                 );
                 return _taskCard(tasks[index], compact);
               },
@@ -2229,6 +2319,7 @@ class _DownloadPageState extends State<DownloadPage> {
                   .clamp(80.0, 400.0)
                   .toDouble(),
               child: ListView.builder(
+                key: PageStorageKey('download-album-tracks:$expansionKey'),
                 primary: false,
                 itemCount: tasks.length,
                 itemBuilder: (_, index) {
@@ -2673,7 +2764,7 @@ class _DownloadPageState extends State<DownloadPage> {
                   ? _albumList(completed, downloaded: true)
                   : visible.isEmpty
                   ? const Center(child: Text('未找到匹配的本地下载记录'))
-                  : Scrollbar(
+                  : AppScrollbar(
                       child: ListView.builder(
                         key: ValueKey('downloadSearch:$query'),
                         itemCount: visible.length,
@@ -2744,7 +2835,7 @@ class _DownloadPageState extends State<DownloadPage> {
       }
     }
     final albums = groups.entries.toList();
-    return Scrollbar(
+    return AppScrollbar(
       child: ListView.builder(
         key: PageStorageKey(
           downloaded ? 'downloaded-albums' : 'download-tasks',
@@ -2836,6 +2927,7 @@ class _DownloadPageState extends State<DownloadPage> {
                             );
                             return task.state != DownloadState.completed;
                           }).toList(),
+                          completed,
                         ),
                         _downloadedLibrary(completed),
                       ],
@@ -2898,7 +2990,7 @@ class _DownloadPageState extends State<DownloadPage> {
           overflow: TextOverflow.ellipsis,
           textAlign: TextAlign.center,
         ),
-        AdaptiveText('账号：${task.accountIdentity}'),
+        AdaptiveText(_downloadAccountLabel(task.accountIdentity)),
         AdaptiveText('目录：${task.finalPath ?? task.rootDirectory}'),
         if (task.error != null)
           Text(

@@ -96,6 +96,10 @@ Map<String, dynamic> _publicRaw(Map<String, dynamic> raw) {
     'isPaid',
     'is_paid',
     'isAuthorized',
+    'is_authorized',
+    'is_free',
+    'sample_duration',
+    'isNoCopyright',
     'intro',
     'coverLarge',
     'coverMiddle',
@@ -108,6 +112,8 @@ Map<String, dynamic> _publicRaw(Map<String, dynamic> raw) {
     'totalCount',
     'isRecordDesc',
     'likes',
+    'play',
+    'vipType',
     'total',
     'year',
     'date',
@@ -115,6 +121,19 @@ Map<String, dynamic> _publicRaw(Map<String, dynamic> raw) {
     final value = raw[key];
     if (value is String || value is bool || (value is num && value.isFinite))
       result[key] = value;
+  }
+  final uid = xmlyPositive(raw['uid']);
+  if (uid != null) result['uid'] = uid;
+  final comments = raw['count_comment'];
+  if (comments is int && comments >= 0) result['count_comment'] = comments;
+  if (raw['avatarPath'] is String) {
+    final avatar = _cover({'coverSmall': raw['avatarPath']});
+    if (avatar != null &&
+        !avatar.hasQuery &&
+        !avatar.hasFragment &&
+        (!avatar.hasPort || avatar.port == 80 || avatar.port == 443)) {
+      result['avatarPath'] = avatar.toString();
+    }
   }
   final nickname = raw['userInfo'] is Map
       ? (raw['userInfo'] as Map)['nickname']
@@ -298,6 +317,20 @@ class Album {
        raw = Map.unmodifiable(_publicRaw(raw)) {
     AppLog.instance.trace("lib/models/xmly_models.dart::Album.new");
   }
+  String? get anchorUid {
+    AppLog.instance.trace('lib/models/xmly_models.dart::Album.anchorUid.get');
+    return xmlyPositive(raw['uid'])?.toString();
+  }
+
+  Uri? get anchorAvatarUrl {
+    AppLog.instance.trace(
+      'lib/models/xmly_models.dart::Album.anchorAvatarUrl.get',
+    );
+    return raw['avatarPath'] is String
+        ? Uri.tryParse(raw['avatarPath'] as String)
+        : null;
+  }
+
   factory Album.fromApi(Map<String, dynamic> value) {
     AppLog.instance.trace("lib/models/xmly_models.dart::Album.factory:fromApi");
     return Album(
@@ -393,6 +426,9 @@ class Track {
     AppLog.instance.trace("lib/models/xmly_models.dart::Track.factory:fromApi");
 
     final duration = value['duration'];
+    final playtimes = value['playtimes'] ?? value['count_play'];
+    final createdAt = value['createdAt'] ?? value['created_at'];
+    final authorized = _flag(value['isAuthorized'] ?? value['is_authorized']);
     // A validated catalogue position defines playback order. Preserve provider
     // ordinal fields in raw, where they cannot override that page position.
     return Track(
@@ -412,10 +448,19 @@ class Track {
           xmlyPositive(value['orderNum']),
       episode: xmlyPositive(value['episode']),
       isPaid: _flag(value['is_paid'] ?? value['isPaid']),
-      isAuthorized: _flag(value['isAuthorized']),
+      isAuthorized: authorized,
       coverUrl: _cover(value) ?? album?.coverUrl,
       intro: _text(value['intro']),
-      raw: {...value, if (position != null) 'officialPosition': position},
+      raw: {
+        ...value,
+        if (value['isAuthorized'] == null && authorized != null)
+          'isAuthorized': authorized,
+        if (value['play'] == null && playtimes is int && playtimes >= 0)
+          'play': playtimes,
+        if (value['date'] == null && createdAt is int && createdAt > 0)
+          'date': createdAt,
+        if (position != null) 'officialPosition': position,
+      },
     );
   }
   factory Track.fromJson(Map<String, dynamic> value) {
@@ -470,7 +515,9 @@ class PlaybackQueue {
     this.albumPage,
     this.albumTotal,
     int? albumPageSize,
+    Map<String, String> accountIdentities = const {},
   }) : source = source ?? (sourceAlbumId.isEmpty ? 'custom' : 'album'),
+       accountIdentities = Map.unmodifiable(accountIdentities),
        albumPageSize = albumPage == null
            ? albumPageSize
            : albumPageSize ?? xmlyAlbumPageSize,
@@ -511,9 +558,17 @@ class PlaybackQueue {
         throw const FormatException('播放队列损坏');
       }
     }
+    for (final entry in accountIdentities.entries) {
+      if (!ids.contains(entry.key) ||
+          (entry.value != 'anonymous' &&
+              !RegExp(r'^[a-f0-9]{64}$').hasMatch(entry.value))) {
+        throw const FormatException('播放队列账号无效');
+      }
+    }
   }
   PlaybackQueue._empty({this.needsRepair = false})
     : tracks = const [],
+      accountIdentities = const {},
       cursor = -1,
       sourceAlbumId = '',
       source = 'custom',
@@ -524,6 +579,7 @@ class PlaybackQueue {
   }
 
   final List<Track> tracks;
+  final Map<String, String> accountIdentities;
   final int cursor;
 
   /// Last loaded natural ascending page at albumPageSize; total 0 is unknown.
@@ -581,6 +637,9 @@ class PlaybackQueue {
       albumPage: page as int?,
       albumTotal: total as int?,
       albumPageSize: size as int?,
+      accountIdentities: value['accountIdentities'] == null
+          ? const {}
+          : Map<String, String>.from(value['accountIdentities'] as Map),
     );
   }
 
@@ -598,6 +657,8 @@ class PlaybackQueue {
             'cursor': cursor,
             'sourceAlbumId': sourceAlbumId,
             'source': source,
+            if (accountIdentities.isNotEmpty)
+              'accountIdentities': accountIdentities,
             if (albumPage != null) 'albumPage': albumPage,
             if (albumTotal != null) 'albumTotal': albumTotal,
             if (albumPageSize != null) 'albumPageSize': albumPageSize,
@@ -698,17 +759,64 @@ class ResolvedAudio {
   }
 }
 
+class AnchorSearchResult {
+  const AnchorSearchResult({
+    required this.uid,
+    required this.nickname,
+    this.avatarUrl,
+    this.tracksCount,
+    this.followersCount,
+    this.albumsCount,
+    this.description = '',
+    this.isVerified = false,
+  });
+
+  final String uid, nickname, description;
+  final Uri? avatarUrl;
+  final int? tracksCount, followersCount, albumsCount;
+  final bool isVerified;
+
+  factory AnchorSearchResult.fromApi(Map<String, dynamic> value) {
+    AppLog.instance.trace(
+      'lib/models/xmly_models.dart::AnchorSearchResult.factory:fromApi',
+    );
+    int? count(Object? raw) {
+      AppLog.instance.trace(
+        'lib/models/xmly_models.dart::AnchorSearchResult.factory:fromApi.count',
+      );
+      return raw is num && raw.isFinite && raw >= 0 ? raw.toInt() : null;
+    }
+
+    return AnchorSearchResult(
+      uid: xmlyIdentifier(_text(value['uid'])),
+      nickname: _text(value['nickname']),
+      avatarUrl: _cover({'coverSmall': value['smallPic']}),
+      tracksCount: count(value['tracks_counts']),
+      followersCount: count(value['followers_counts']),
+      albumsCount: count(value['album_counts']),
+      description: _text(value['description'] ?? value['personDescribe']),
+      isVerified: value['isVerified'] == true,
+    );
+  }
+}
+
 class SearchPage {
   final List<Track> tracks;
   final List<Album> albums;
+  final List<AnchorSearchResult> anchors;
+  final Map<String, int> totals;
   final int page, pageSize, total;
+  final int? totalPages;
   final String kind;
   SearchPage({
     this.tracks = const [],
     this.albums = const [],
+    this.anchors = const [],
+    this.totals = const {},
     required this.page,
     required this.pageSize,
     required this.total,
+    this.totalPages,
     required this.kind,
   }) {
     AppLog.instance.trace("lib/models/xmly_models.dart::SearchPage.new");
@@ -719,12 +827,14 @@ class AlbumPage {
   final Album album;
   final List<Track> tracks;
   final int page, pageSize, total;
+  final bool ascending;
   AlbumPage({
     required this.album,
     required this.tracks,
     required this.page,
     required this.pageSize,
     required this.total,
+    required this.ascending,
   }) {
     AppLog.instance.trace("lib/models/xmly_models.dart::AlbumPage.new");
   }

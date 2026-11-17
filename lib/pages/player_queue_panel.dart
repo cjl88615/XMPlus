@@ -2,10 +2,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../common/widgets/app_scrollbar.dart';
 import '../common/widgets/adaptive_text.dart';
 import '../models/xmly_models.dart';
 import '../services/app_log.dart';
 import '../services/app_runtime.dart';
+import 'playback_mode_control.dart';
 
 void _recordQueueError(
   String operation,
@@ -39,6 +41,8 @@ void _recordQueueError(
         'rate_limited',
         'queue_full',
         'catalogue_limit',
+        'queue_changed',
+        'catalogue_changed',
       }.contains(error.code);
   log.write(
     recoverable || expected ? AppLogLevel.warning : AppLogLevel.error,
@@ -214,6 +218,22 @@ class _PlayerQueuePanelState extends State<PlayerQueuePanel> {
     await _run(widget.runtime.player.clearQueue);
   }
 
+  Future<void> _reverse() async {
+    AppLog.instance.trace(
+      "lib/pages/player_queue_panel.dart::_PlayerQueuePanelState._reverse",
+    );
+
+    await _run(widget.runtime.player.reverseQueue);
+    if (!mounted || _error != null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      AppLog.instance.trace(
+        "lib/pages/player_queue_panel.dart::_PlayerQueuePanelState._reverse.closure#1",
+      );
+
+      if (mounted) _showCurrent();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     AppLog.instance.trace(
@@ -275,6 +295,7 @@ class _PlayerQueuePanelState extends State<PlayerQueuePanel> {
                                     ],
                                   ),
                                 ),
+                                PlaybackModeButton(runtime: widget.runtime),
                                 IconButton(
                                   tooltip: '回到当前播放',
                                   onPressed: player.current == null
@@ -341,6 +362,20 @@ class _PlayerQueuePanelState extends State<PlayerQueuePanel> {
                             child: Wrap(
                               spacing: 8,
                               children: [
+                                TextButton.icon(
+                                  key: const ValueKey('reversePlayerQueue'),
+                                  onPressed:
+                                      _busy ||
+                                          (_tracks.length < 2 &&
+                                              player.queueSource != 'album')
+                                      ? null
+                                      : _reverse,
+                                  icon: const Icon(
+                                    Icons.swap_vert_rounded,
+                                    size: 20,
+                                  ),
+                                  label: const Text('倒序'),
+                                ),
                                 if (player.queueSource == 'album' &&
                                     player.sourceAlbumId.isNotEmpty)
                                   TextButton(
@@ -385,7 +420,7 @@ class _PlayerQueuePanelState extends State<PlayerQueuePanel> {
                   Expanded(
                     child: _tracks.isEmpty
                         ? const Center(child: Text('队列为空'))
-                        : Scrollbar(
+                        : AppScrollbar(
                             controller: _scroll,
                             child: ReorderableListView.builder(
                               key: const ValueKey('playerQueueScroll'),
