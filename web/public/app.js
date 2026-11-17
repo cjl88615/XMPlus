@@ -44,6 +44,28 @@
     subTab:'albums', subData:null, queue:[], index:-1, track:null, lastView:'explore',
     restoring:false, modal:'', qrPoll:null, jobsPoll:null, requestVersion:0
   };
+  // Playback ownership is independent of the currently browsed album.
+  let playbackGeneration = 0;
+  let movement = Promise.resolve();
+  let seekListener = null;
+  const PAGE_SIZE = 30;
+  function albumPageInfo(result, page) {
+    const total = Math.max(Number(result.totalCount) || 0, Number(result.album?.trackCount) || 0);
+    const max = Number(result.maxPageId) || 0;
+    const pages = Math.max(max, Math.ceil(total / PAGE_SIZE));
+    const tracks = result.tracks || [];
+    const hasMore = max > page || total > page * PAGE_SIZE ? true :
+      typeof result.hasMore === 'boolean' ? result.hasMore :
+      max >= page && !total ? false : tracks.length === PAGE_SIZE;
+    return {page, pages, total, hasMore};
+  }
+  function albumQueueContext() {
+    return {albumId:state.albumId, ...state.albumPaging};
+  }
+  function pageTracks(result, id) {
+    return (result.tracks || []).map(t=>({...t,albumId:id,
+      albumTitle:result.album.title,cover:t.cover||result.album.cover}));
+  }
   let toastTimer;
   let lastProgressSave = 0;
   let pendingSeek = null;
@@ -178,8 +200,9 @@
     const id=state.albumId, page=state.albumPage;
     const result=await api('/api/album/'+id+'?page='+page);
     if(mark!==state.requestVersion)return;
-    state.album={...result.album,trackCount:result.totalCount||result.album.trackCount||0};
-    state.albumTracks=(result.tracks||[]).map(t=>({...t,albumId:id,albumTitle:result.album.title,cover:t.cover||result.album.cover}));
+    state.album={...result.album,trackCount:albumPageInfo(result,page).total};
+    state.albumTracks=pageTracks(result,id);
+    state.albumPaging=albumPageInfo(result,page);
     state.albumTotal=result.totalCount||0;
     renderAlbum();
   }
@@ -189,7 +212,7 @@
     const favorited=state.session.favorites.some(x=>String(x.id)===String(album.id));
     const src=cover(album.cover);
     const desc=album.intro || '';
-    const pageCount=Math.max(state.albumPage,Math.ceil(state.albumTotal/30));
+    const pageCount=Math.max(state.albumPage,state.albumPaging.pages,state.albumPaging.hasMore?state.albumPage+1:0);
     const selected=state.selected.size;
     const detail='<button class="back-link" data-action="back">'+icon('back')+' 返回</button>'+
       '<div class="album-detail"><div>'+(src?'<img class="detail-cover" src="'+escapeHtml(src)+'" alt="专辑封面">':'<div class="detail-cover cover-placeholder">♪</div>')+'</div>'+
@@ -200,12 +223,13 @@
       '<button class="btn" data-action="favorite">'+icon('heart')+(favorited?' 已收藏':' 收藏')+'</button>'+
       (state.session.loggedIn?'<button class="btn btn-quiet" data-action="subscribe">'+icon('library')+' 订阅</button>':'')+
       '</div></div></div>';
-    const toolbar='<div class="list-header"><h2>声音列表 <small>'+countText(album.trackCount||state.albumTotal)+' 集</small></h2>'+
+    const toolbar='<div class="list-header"><h2>声音列表 <small>'+((album.trackCount||state.albumTotal)?countText(album.trackCount||state.albumTotal)+' 集':'本页 '+state.albumTracks.length+' 集')+'</small></h2>'+
       '<div class="list-toolbar">'+(selected?'<span class="selection-text">已选 '+selected+' 首</span>':'')+
       '<button class="btn btn-quiet" data-action="select-page">'+(state.albumTracks.every(t=>state.selected.has(String(t.id)))?'取消本页':'全选本页')+'</button>'+
       '<button class="btn btn-primary" data-action="batch"'+(selected?'':' disabled')+'>'+icon('download')+' 批量下载</button></div></div>';
     const rows=state.albumTracks.length?'<div class="track-list">'+state.albumTracks.map((t,i)=>trackRow(t,(state.albumPage-1)*30+i+1,true)).join('')+'</div>':empty('该页暂无声音','部分专辑可能已下架');
-    content.innerHTML=detail+toolbar+rows+pagination(state.albumPage,pageCount,'album');
+    content.innerHTML=detail+toolbar+rows+pagination(state.albumPage,pageCount,'album')+
+      '<form id="album-jump-form" class="pagination"><label for="album-jump">跳到目录序号</label><input id="album-jump" type="number" min="1" step="1" inputmode="numeric" aria-label="目录序号" style="width:7em"><button class="btn" type="submit">定位</button><span>第 '+state.albumPage+' 页 · 每页 30 集'+(state.albumPaging.hasMore?' · 还有后续':'')+'</span></form>';
   }
   function renderFavorites() {
     const items=state.session.favorites||[];
@@ -277,7 +301,7 @@
   }
   function saveLast() {
     if(!state.track)return;
-    const item={queue:state.queue,index:state.index,track:state.track,position:audio.currentTime||0};
+    const item={queue:state.queue,index:state.index,track:state.track,position:audio.currentTime||0,albumQueue:state.albumQueue||null};
     try {localStorage.setItem('xmplus_last',JSON.stringify(item));} catch {}
   }
   function renderPlayer() {
@@ -302,8 +326,12 @@
     if(document.activeElement!==$('#volume'))$('#volume').value=String(Math.round(prefs.volume*100));
     document.body.classList.add('has-player');
   }
-  async function playTrack(track, queue, idx, resumeAt=0, shouldPlay=true) {
+  async function playTrack(track, queue, idx, resumeAt=0, shouldPlay=true, albumQueue=null, internal=false) {
     if(!track || !toId(track.id))return;
+    if(!internal) {++playbackGeneration; movement=Promise.resolve();}
+    const generation=playbackGeneration;
+    state.albumQueue=albumQueue ? {...albumQueue} : null;
+    if(seekListener) {audio.removeEventListener('loadedmetadata',seekListener);seekListener=null;}
     state.queue=queue&&queue.length?queue:[track];
     state.index=Math.max(0,idx);
     state.track=track;
@@ -313,11 +341,15 @@
     audio.playbackRate=prefs.rate;
     audio.volume=prefs.volume;
     audio.load();
-    if(resumeAt>0) audio.addEventListener('loadedmetadata',function once(){audio.removeEventListener('loadedmetadata',once);audio.currentTime=Math.min(resumeAt,Math.max(0,(audio.duration||resumeAt+1)-1));},{once:true});
+    if(resumeAt>0) {
+      seekListener=function once(){audio.removeEventListener('loadedmetadata',once);seekListener=null;
+        if(generation===playbackGeneration) audio.currentTime=Math.min(resumeAt,Math.max(0,(audio.duration||resumeAt+1)-1));};
+      audio.addEventListener('loadedmetadata',seekListener,{once:true});
+    }
     renderPlayer();
     saveLast();
     if(shouldPlay) {
-      try {await audio.play();} catch(e) { if(e.name!=='AbortError')toast(e.name==='NotAllowedError'?'浏览器已阻止自动播放，请点播放按钮':'播放失败，可能需要登录或已购权限',true); }
+      try {await audio.play();} catch(e) { if(generation===playbackGeneration && e.name!=='AbortError')toast(e.name==='NotAllowedError'?'浏览器已阻止自动播放，请点播放按钮':'播放失败，可能需要登录或已购权限',true); }
     }
   }
   function recordPlayback() {
@@ -341,11 +373,43 @@
     return [findTrack(id)].filter(Boolean);
   }
   function moveTrack(offset) {
-    if(!state.queue.length)return;
-    let index=state.index+offset;
-    if(index>=state.queue.length) index=0;
-    if(index<0)index=state.queue.length-1;
-    void playTrack(state.queue[index],state.queue,index);
+    const generation=playbackGeneration;
+    // Serialize rapid taps; new explicit playback invalidates every old operation.
+    movement=movement.then(async()=>{
+      if(generation!==playbackGeneration || !state.queue.length)return;
+      let index=state.index+offset;
+      let queue=state.queue, context=state.albumQueue;
+      if(context) {
+        if(index<0 || index>=queue.length) {
+          if(offset<0 && context.page<=1)return;
+          if(offset>0 && !context.hasMore) {audio.pause();toast('已到专辑末尾');return;}
+          const page=context.page+(offset>0?1:-1);
+          const result=await api('/api/album/'+context.albumId+'?page='+page);
+          if(generation!==playbackGeneration)return;
+          const next=pageTracks(result,context.albumId);
+          if(!next.length) {
+            if(offset>0){state.albumQueue={...context,hasMore:false};saveLast();audio.pause();toast('已到专辑末尾');}
+            else toast('上一页暂无声音',true);
+            return;
+          }
+          // Reject repeated catalog pages rather than silently looping.
+          if(next.some(t=>queue.some(old=>String(old.id)===String(t.id)))) throw Error('目录返回重复页，已停止续播');
+          context={albumId:context.albumId,...albumPageInfo(result,page)};
+          queue=next;
+          index=offset>0?0:queue.length-1;
+        }
+      } else {
+        if(index>=queue.length)index=0;
+        if(index<0)index=queue.length-1;
+      }
+      // Do not block subsequent taps on a browser play() promise.
+      void playTrack(queue[index],queue,index,0,true,context,true);
+    }).catch(e=>{if(generation===playbackGeneration){
+      // A failed boundary cancels already queued taps; only a fresh user action retries.
+      ++playbackGeneration;
+      audio.pause();toast('续播失败：'+e.message+'，请手动重试',true);
+    }});
+    return movement;
   }
   function downloadTrack(id) {
     const link=document.createElement('a');
@@ -406,7 +470,7 @@
   function showQueue() {
     if(!state.queue.length){toast('播放队列为空');return;}
     state.modal='queue';
-    modalRoot.innerHTML='<div class="modal-backdrop" data-action="modal-bg"><aside class="queue-drawer" role="dialog" aria-modal="true" aria-label="播放队列"><div class="queue-header"><h2>播放队列 · '+state.queue.length+'</h2><button class="icon-button" data-action="modal-close" aria-label="关闭">'+icon('close')+'</button></div>'+
+    modalRoot.innerHTML='<div class="modal-backdrop" data-action="modal-bg"><aside class="queue-drawer" role="dialog" aria-modal="true" aria-label="播放队列"><div class="queue-header"><h2>播放队列 · '+(state.albumQueue?'专辑第 '+state.albumQueue.page+' 页 · 按需续播':state.queue.length)+'</h2><button class="icon-button" data-action="modal-close" aria-label="关闭">'+icon('close')+'</button></div>'+
       state.queue.map((t,i)=>'<button class="queue-row'+(i===state.index?' active':'')+'" data-action="queue-play" data-index="'+i+'"><small>'+String(i+1).padStart(2,'0')+'</small><span>'+escapeHtml(t.title)+'</span>'+(i===state.index?icon('play'):'')+'</button>').join('')+'</aside></div>';
     modalRoot.querySelector('[data-action="modal-close"]').focus();
   }
@@ -448,11 +512,11 @@
         const t=findTrack(id);
         if(!t) return toast('声音信息不存在',true);
         const queue=playingQueue(id);
-        void playTrack(t,queue,Math.max(0,queue.findIndex(x=>String(x.id)===id)));
+        void playTrack(t,queue,Math.max(0,queue.findIndex(x=>String(x.id)===id)),0,true,state.view==='album'?albumQueueContext():null);
         break;
       }
       case 'play-all':
-        if(state.albumTracks.length)void playTrack(state.albumTracks[0],state.albumTracks,0);
+        if(state.albumTracks.length)void playTrack(state.albumTracks[0],state.albumTracks,0,0,true,albumQueueContext());
         else toast('当前页暂无可播放的声音',true);break;
       case 'toggle':if(!state.track)return;
         if(audio.paused){audio.play().catch(()=>toast('播放失败，请检查网络或账号权限',true));}
@@ -462,7 +526,7 @@
       case 'queue':showQueue();break;
       case 'queue-play':{
         const i=Number(el.dataset.index);
-        if(state.queue[i]) {void playTrack(state.queue[i],state.queue,i);closeModal();}
+        if(state.queue[i]) {void playTrack(state.queue[i],state.queue,i,0,true,state.albumQueue);closeModal();}
         break;
       }
       case 'download-track':downloadTrack(id);break;
@@ -524,6 +588,14 @@
     if(e.target.id==='speed'||e.target.id==='setting-speed'){prefs.rate=Number(e.target.value)||1;audio.playbackRate=prefs.rate;localStorage.setItem('xmplus_rate',String(prefs.rate));$('#speed').value=String(prefs.rate);if(state.view==='settings')renderSettings();}
     if(e.target.id==='volume'){prefs.volume=Number(e.target.value)/100;audio.volume=prefs.volume;localStorage.setItem('xmplus_volume',String(prefs.volume));}
   });
+  document.addEventListener('submit',e=>{
+    if(e.target.id!=='album-jump-form')return;
+    e.preventDefault();
+    const sequence=Number($('#album-jump').value);
+    if(!Number.isSafeInteger(sequence)||sequence<1)return toast('请输入有效目录序号',true);
+    state.albumPage=Math.floor((sequence-1)/PAGE_SIZE)+1;
+    void go('album',state.albumId,false);
+  });
   $('#search-form').addEventListener('submit',e=>{
     e.preventDefault();
     const q=$('#search-input').value.trim();
@@ -553,7 +625,7 @@
   audio.addEventListener('play',renderPlayer);
   audio.addEventListener('playing',recordPlayback);
   audio.addEventListener('pause',()=>{renderPlayer();saveLast();});
-  audio.addEventListener('ended',()=>{if(prefs.autoplay&&state.queue.length>1)moveTrack(1);});
+  audio.addEventListener('ended',()=>{if(prefs.autoplay&&(state.albumQueue||state.queue.length>1))void moveTrack(1);});
   audio.addEventListener('error',()=>{if(state.track)toast('音频无法播放，请检查网络或账号权限',true);});
   window.addEventListener('keydown',e=>{if(e.key==='Escape'&&state.modal)closeModal();});
   window.addEventListener('popstate',onNavigate);
@@ -565,7 +637,7 @@
     try{
       const prev=JSON.parse(localStorage.getItem('xmplus_last')||'null');
       if(prev && prev.track && toId(prev.track.id)){
-        await playTrack(prev.track,Array.isArray(prev.queue)?prev.queue:[prev.track],Number(prev.index)||0,Number(prev.position)||0,false);
+        await playTrack(prev.track,Array.isArray(prev.queue)?prev.queue:[prev.track],Number(prev.index)||0,Number(prev.position)||0,false,prev.albumQueue&&toId(prev.albumQueue.albumId)&&Number.isInteger(prev.albumQueue.page)&&prev.albumQueue.page>0?prev.albumQueue:null);
       }
     }catch{}
     void onNavigate();
